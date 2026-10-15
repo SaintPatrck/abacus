@@ -1,0 +1,7 @@
+.PHONY: check gate test
+test:
+	python3 -m unittest discover -s tests -t . -q
+check: test
+gate: test
+sync-textkit:
+	sh scripts/sync-textkit.sh $(REV)

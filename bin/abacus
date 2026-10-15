@@ -1,0 +1,1283 @@
+#!/usr/bin/env python3
+"""abacus: install Abacus on a developer machine and run the two-repository demo.
+
+  abacus --version                             the Abacus version and the commit of each installed component
+  abacus install [--workspace DIR ...] [--dev] [--yes]  guided setup: prerequisites, publish, deploy, PATH, status line
+  abacus doctor                                prerequisites, install, PATH, folder trust, status line; run inside
+                                               an adopted repository, it checks that repository too
+  abacus add [PATH] [--gate CMD] [--yes]       bring a repository into Abacus: board, conventions, worker, trust
+  abacus trust                                 open each Abacus folder Claude Code hasn't trusted yet, one at a time
+  abacus demo setup [--scenario S] [--force]   generate a demo sandbox: two-repo (default), decision or heartbeat
+  abacus demo start                            start coder:repo-a, coder:repo-b and agent:concierge in Agent View
+  abacus demo status                           doctor both repos, logbook digest, session liveness
+  abacus demo stop                             stop the demo sessions (refuses unsaved work)
+  abacus demo reset [--scenario S] [--empty-boards]
+                                               put a demo back to its starting point for another run (archives
+                                               the logbook); heartbeat keeps its build cache
+  abacus chat                                  talk to Abacus: start the concierge if needed and attach to it
+  abacus prune [--keep N] [--dry-run]          clear Agent View records of stopped Abacus sessions (never running ones)
+  abacus status                                needs-you, program, in-flight, sessions (one screen)
+  abacus statusline enable|disable [--wrap|--replace]
+                                               show Abacus state in every Claude Code session's status line;
+                                               --wrap keeps a status line you already have and appends to it
+"""
+import argparse
+import json
+import re
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import io
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+USER_PATH = os.environ.get("PATH", "")  # the operator's real PATH, captured before main() prepends ~/.abacus/bin
+HOME = Path(os.environ.get("ABACUS_HOME", Path.home() / ".abacus")).expanduser()
+COMPONENTS = ("abacus-infra", "abacus-standards", "abacus-agents")
+RENAMED = {"abacus-agents": "abacus-orchestrator"}  # new name -> old name (0.4.0)
+CLIS = {
+    "abacus": ["abacus"],
+    "abacus-infra": ["abacus-logbook", "abacus-memory", "abacus-verify", "abacus-session", "abacus-lock",
+                     "abacus-status"],
+    "abacus-standards": ["abacus-doctor", "abacus-adopt", "abacus-finalize", "abacus-board", "abacus-judgment",
+                         "abacus-record-id", "abacus-validate-records", "abacus-authorize"],
+    "abacus-agents": ["abacus-deploy"],
+}
+# Demo scenarios: their files and beads are in demos/<scenario>/; each gets its own sandbox and workers.
+SCENARIOS = {"two-repo": {"repos": ("repo-a", "repo-b")}, "decision": {"repos": ("ledger",)},
+             "heartbeat": {"repos": ("sdk-internal", "bwcli-rs")}}
+
+
+def say(msg):
+    print(f"abacus: {msg}")
+
+
+def die(msg):
+    print(f"abacus: ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd, cwd=None, check=True, env=None, input=None):
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, input=input,
+                       env=dict(os.environ, **(env or {})))
+    if check and p.returncode != 0:
+        die(f"`{' '.join(map(str, cmd))}` failed:\n{(p.stderr or p.stdout).strip()}")
+    return p
+
+
+def config():
+    p = HOME / "config.json"
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
+# ------------------------------------------------------------------ prerequisites
+
+LINUX_PACKAGE_MANAGERS = (("apt-get", "sudo apt-get install {pkg}"), ("dnf", "sudo dnf install {pkg}"),
+                          ("yum", "sudo yum install {pkg}"), ("pacman", "sudo pacman -S {pkg}"),
+                          ("zypper", "sudo zypper install {pkg}"), ("apk", "sudo apk add {pkg}"))
+
+
+def install_hint(tool, platform=None, which=None):
+    """How to install a missing prerequisite on this machine (tested on macOS; Linux expected to work)."""
+    platform, which = platform or sys.platform, which or shutil.which
+    if tool == "claude":
+        return "npm i -g @anthropic-ai/claude-code   (then: claude update)"
+    if tool == "bd":
+        return "brew install beads   (or: npm install -g @beads/bd)" if which("brew") else "npm install -g @beads/bd"
+    if platform.startswith("win"):
+        return f"run Abacus under WSL (Windows Subsystem for Linux) and install {tool} there"
+    if platform == "darwin":
+        return "xcode-select --install" + ("   (or: brew install python)" if tool == "python3" else "")
+    pkg = "python3" if tool == "python3" else tool
+    for pm, cmd in LINUX_PACKAGE_MANAGERS:
+        if which(pm):
+            return cmd.format(pkg=pkg)
+    return f"install {pkg} with your system's package manager"
+
+
+def prereqs():
+    rows = []
+    v = sys.version_info
+    rows.append(("python3 >= 3.9", v >= (3, 9), f"{v.major}.{v.minor}.{v.micro}", install_hint("python3")))
+    for tool, fix in (("git", install_hint("git")), ("claude", install_hint("claude")), ("bd", install_hint("bd"))):
+        path = shutil.which(tool)
+        ver = run([tool, "--version"], check=False).stdout.strip().splitlines()[0] if path else "missing"
+        rows.append((tool, bool(path), ver, fix))
+    if shutil.which("claude"):
+        helptext = run(["claude", "--help"], check=False).stdout
+        ok = "--bg" in helptext and "agents" in helptext
+        rows.append(("claude Agent View (--bg, agents)", ok, "present" if ok else "missing",
+                     "update Claude Code: claude update"))
+    return rows
+
+
+def print_prereqs(rows):
+    for name, ok, ver, fix in rows:
+        print(f"  {'ok ' if ok else 'MISSING'}  {name:<34} {ver}" + ("" if ok else f"\n           fix: {fix}"))
+    return all(ok for _, ok, _, _ in rows)
+
+
+# ------------------------------------------------------------------ install
+
+# ------------------------------------------------------------------ onboarding helpers
+
+PATH_LINE = 'export PATH="$HOME/.abacus/bin:$PATH"'
+
+
+def ask(question, assume_yes=False):
+    """Yes/no prompt. Never asks when stdin is not a terminal (then the answer is no)."""
+    if assume_yes:
+        say(f"{question} yes (--yes)")
+        return True
+    if not sys.stdin.isatty():
+        return False
+    try:
+        return input(f"abacus: {question} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def shell_rc():
+    shell = os.path.basename(os.environ.get("SHELL", "zsh"))
+    return Path.home() / {"zsh": ".zshrc", "bash": ".bashrc"}.get(shell, ".profile")
+
+
+STARTUP_FILES = (".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile", ".profile")
+
+
+def path_state():
+    """(on the current PATH, configured in a shell startup file, that file or the rc file to use)."""
+    on_path = str(HOME / "bin") in USER_PATH.split(os.pathsep)
+    for name in STARTUP_FILES:
+        f = Path.home() / name
+        if f.exists() and ".abacus/bin" in f.read_text():
+            return on_path, True, f
+    return on_path, False, shell_rc()
+
+
+def abacus_folders():
+    """Folders Abacus starts background sessions in: the deployed roles plus every repository in the fleet."""
+    agents = HOME / "agents"
+    folders = sorted(d for d in agents.iterdir() if d.is_dir() and d.name != "hooks") if agents.is_dir() else []
+    for f in (HOME / "agents" / "fleet.json", HOME / "fleet.json"):
+        if f.exists():
+            for name, w in json.loads(f.read_text()).get("workers", {}).items():
+                repo = Path(os.path.expanduser(w.get("repo", "")))
+                if not name.startswith("agent:") and repo.is_dir():
+                    folders.append(repo)
+            break
+    seen, out = set(), []
+    for d in folders:
+        k = str(d.resolve())
+        if k not in seen:
+            seen.add(k); out.append(Path(k))
+    return out
+
+
+def untrusted(folders):
+    """Folders Claude Code has not trusted yet (read-only look at ~/.claude.json). None if it can't tell."""
+    try:
+        projects = json.loads((Path.home() / ".claude.json").read_text()).get("projects", {})
+    except (OSError, ValueError):
+        return None
+    return [f for f in folders if not projects.get(str(f), {}).get("hasTrustDialogAccepted")]
+
+
+def statusline_enabled():
+    try:
+        sl = json.loads((Path.home() / ".claude" / "settings.json").read_text()).get("statusLine") or {}
+    except (OSError, ValueError):
+        return False
+    return "abacus-status" in str(sl.get("command", ""))
+
+
+def statusline_state():
+    try:
+        sl = json.loads(CLAUDE_SETTINGS.read_text()).get("statusLine") or {}
+    except (OSError, ValueError):
+        sl = {}
+    if sl.get("command") == WRAPPED_COMMAND:
+        return "enabled (appended to your own status line)"
+    if statusline_enabled():
+        return "enabled"
+    if sl:
+        return "off: you have your own (optional: abacus statusline enable --wrap)"
+    return "off (optional: abacus statusline enable)"
+
+
+def existing_statusline():
+    """The operator's own status line, if they have one that isn't Abacus's."""
+    try:
+        sl = json.loads(CLAUDE_SETTINGS.read_text()).get("statusLine")
+    except (OSError, ValueError):
+        return None
+    return None if not sl or abacus_statusline(sl) else sl
+
+
+def version():
+    """The suite version: one number for all four repositories (abacus/VERSION)."""
+    f = ROOT / "VERSION"
+    return f.read_text().strip() if f.exists() else "unknown"
+
+
+def source_root():
+    """This repository's clone. The installed copy (~/.abacus/lib/abacus) has no .git; install recorded the clone."""
+    if (ROOT / ".git").exists():
+        return ROOT
+    return Path(config().get("components", {}).get("abacus") or ROOT)
+
+
+def installed(name):
+    lib = HOME / "lib" / name
+    if lib.is_symlink():
+        return f"working tree (dev) {os.path.realpath(lib)}"
+    pub = lib / ".published"
+    return pub.read_text().strip() if pub.exists() else "not installed"
+
+
+def print_version():
+    print(f"abacus {version()}")
+    for name in ("abacus",) + COMPONENTS:
+        print(f"  {name:<20} {installed(name)}")
+
+
+def workspace_roots():
+    """The fence's workspace roots, first one first (demos go there). Older installs recorded only one."""
+    cfg = config()
+    return cfg.get("workspace_roots") or ([cfg["workspace_root"]] if cfg.get("workspace_root") else [])
+
+
+def find_components(base):
+    found = {}
+    for c in COMPONENTS:
+        p = (base / c).resolve()
+        if not (p / ".git").exists():
+            old = RENAMED.get(c)
+            if old and (base / old / ".git").exists():
+                die(f"{c} not found, but {base / old} is there: {old} was renamed {c} in 0.4.0. "
+                    f"Rename the folder (`mv {base / old} {p}`) and run the installer again.")
+            die(f"{c} not found at {p}. Clone it next to this repository, or pass --components-dir.")
+        found[c] = p
+    return found
+
+
+def publish(name, src, dev):
+    """Copy the component's committed HEAD (or link the working tree in --dev) into ~/.abacus/lib."""
+    dst = HOME / "lib" / name
+    if dst.is_symlink() or dst.exists():
+        dst.unlink() if dst.is_symlink() else shutil.rmtree(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dev:
+        dst.symlink_to(src)
+        return "working tree (dev)"
+    if run(["git", "status", "--porcelain"], cwd=src, check=False).stdout.strip():
+        die(f"{name} has uncommitted changes; install publishes committed HEAD only (use --dev to link the tree)")
+    head = run(["git", "rev-parse", "HEAD"], cwd=src, check=False)
+    if head.returncode != 0:
+        die(f"{name} has no commits yet; commit it or use --dev")
+    tar = subprocess.run(["git", "archive", "--format=tar", "HEAD"], cwd=src, capture_output=True, check=True).stdout
+    dst.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(tar)) as t:
+        t.extractall(dst)
+    (dst / ".published").write_text(head.stdout.strip()[:12] + "\n")
+    return f"published {head.stdout.strip()[:12]}"
+
+
+def cmd_install(a):
+    say("checking prerequisites")
+    rows = prereqs()
+    if not print_prereqs(rows) and not a.skip_prereqs:
+        missing = [name for name, ok, _, _ in rows if not ok]
+        if missing == ["bd"] and shutil.which("brew") and ask("Beads (bd) is missing. Install it now with `brew install beads`?", a.yes):
+            if subprocess.call(["brew", "install", "beads"]) != 0 or not shutil.which("bd"):
+                die("`brew install beads` did not succeed; install Beads and re-run")
+        else:
+            die("install the missing prerequisites above, then re-run (or --skip-prereqs to continue anyway)")
+    src = source_root()
+    comps = {"abacus": src, **find_components(Path(a.components_dir).expanduser() if a.components_dir else src.parent)}
+    # a reinstall keeps the workspace roots chosen before unless --workspace (repeatable) names them again
+    roots = [Path(w).expanduser().resolve() for w in (a.workspace or workspace_roots() or [src.parent])]
+    for r in roots:
+        if not r.is_dir():
+            die(f"workspace root {r} does not exist")
+    HOME.mkdir(parents=True, exist_ok=True)
+    (HOME / "bin").mkdir(exist_ok=True)
+    for new, old in RENAMED.items():  # an install from before a rename leaves the old snapshot behind
+        stale = HOME / "lib" / old
+        if stale.is_symlink():
+            stale.unlink()
+        elif stale.exists():
+            shutil.rmtree(stale)
+    for name, src in comps.items():
+        say(f"{name}: {publish(name, src, a.dev)}")
+        for cli in CLIS[name]:
+            link = HOME / "bin" / cli
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(HOME / "lib" / name / "bin" / cli)
+    cfg = config()
+    cfg.update({"workspace_root": str(roots[0]), "workspace_roots": [str(r) for r in roots], "standards_path": str(HOME / "lib" / "abacus-standards"),
+                "components": {k: str(v) for k, v in comps.items()}, "dev": bool(a.dev)})
+    (HOME / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
+    env = {"PATH": f"{HOME / 'bin'}:{os.environ['PATH']}"}
+    run(["abacus-logbook", "init"], env=env)
+    run(["abacus-memory", "migrate"], env=env)
+    fleet = HOME / "fleet.json"
+    example = json.loads((comps["abacus-agents"] / "fleet.example.json").read_text())
+    roles = {k: v for k, v in example["workers"].items() if k.startswith("agent:")}
+    current = json.loads(fleet.read_text()) if fleet.exists() else {"workers": {}}
+    added = [k for k in roles if k not in current["workers"]]  # new roles (e.g. the concierge) join existing fleets
+    for k in added:
+        current["workers"][k] = roles[k]
+    if added or not fleet.exists():
+        fleet.write_text(json.dumps(current, indent=2) + "\n")
+        say(f"{fleet}: added {', '.join(added)} (add your repositories as coder:<repo> entries)")
+    deploy = ["abacus-deploy"] + (["--allow-unpublished"] if a.dev else [])
+    out = run(deploy, env=env, check=False)
+    if out.returncode != 0:
+        die(f"deploy failed: {(out.stderr or out.stdout).strip()}")
+    deployed = sorted(d.name for d in (HOME / "agents").iterdir() if d.is_dir() and d.name != "hooks")
+    say(f"roles deployed to {HOME / 'agents'} ({', '.join(deployed)})")
+    try:
+        restart = json.loads(out.stdout).get("restart_needed") or []
+    except ValueError:
+        restart = []
+    if restart:
+        say(f"restart these live role sessions to pick up the change: {', '.join(restart)}")
+    say("workspace roots (repo fence boundary; repositories in fleet.json are fenced wherever they live):")
+    for r in roots:
+        print(f"  {r}")
+    finish_setup(a)
+
+
+PATH_LINK_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "~/.local/bin", "~/bin")
+
+
+def abacus_link():
+    """Where `abacus` is linked into a folder already on your PATH (so it works in this terminal), if anywhere."""
+    p = config().get("abacus_link")
+    return Path(p) if p and Path(p).is_symlink() else None
+
+
+def link_abacus_on_path():
+    """A program can't change its parent shell's PATH, so also link `abacus` into a folder that's already on it."""
+    if os.environ.get("ABACUS_NO_PATH_LINK"):
+        return None
+    on_path = [os.path.realpath(d) for d in USER_PATH.split(os.pathsep) if d]
+    target = HOME / "bin" / "abacus"
+    for d in PATH_LINK_DIRS:
+        d = Path(os.path.expanduser(d))
+        if not d.is_dir() or os.path.realpath(d) not in on_path or not os.access(d, os.W_OK):
+            continue
+        link = d / "abacus"
+        if link.is_symlink() and Path(os.path.realpath(link)) == Path(os.path.realpath(target)):
+            return link
+        if link.exists() or link.is_symlink():
+            continue  # something else called abacus lives here; leave it alone
+        link.symlink_to(target)
+        cfg = config(); cfg["abacus_link"] = str(link)
+        (HOME / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
+        return link
+    return None
+
+
+def finish_setup(a):
+    """The steps a new user would otherwise have to find in the docs: PATH, status line, folder trust."""
+    todo = []
+    on_path, in_rc, rc = path_state()
+    if not in_rc:
+        if ask(f"Add Abacus to your PATH by appending `{PATH_LINE}` to {rc}?", a.yes):
+            with rc.open("a") as f:
+                f.write(f"\n# Abacus\n{PATH_LINE}\n")
+            in_rc = True
+            say(f"added to {rc}")
+        else:
+            todo.append(f"add `{PATH_LINE}` to {rc} (required: your sessions call abacus-* commands)")
+    link = link_abacus_on_path()
+    if link:
+        say(f"linked `abacus` into {link.parent} (already on your PATH), so it works in this terminal now")
+    if in_rc and not on_path:
+        todo.append(f"new terminals pick up ~/.abacus/bin; in this one, run `source {rc}` before starting Claude Code "
+                    "sessions of your own" + ("" if link else " (and before typing `abacus`)"))
+    if not statusline_enabled():
+        if existing_statusline():
+            if ask("You have your own status line. Append Abacus's state to it? Yours keeps working, and "
+                   "`abacus statusline disable` restores it exactly (edits ~/.claude/settings.json)", a.yes):
+                cmd_statusline(argparse.Namespace(action="enable", replace=False, wrap=True))
+            else:
+                todo.append("optional: `abacus statusline enable --wrap` to add Abacus's state to your status line")
+        elif ask("Show Abacus state in every Claude Code session's status line (edits ~/.claude/settings.json)?", a.yes):
+            cmd_statusline(argparse.Namespace(action="enable", replace=False, wrap=False))
+        else:
+            todo.append("optional: `abacus statusline enable` to see Abacus state in every Claude Code session")
+    pending = untrusted(abacus_folders())
+    if pending:
+        todo.append("trust these folders once so background sessions can start there (`abacus trust` opens each):"
+                    + "".join(f"\n      {f}" for f in pending))
+    print()
+    say("checking the install (`abacus doctor`):")
+    cmd_doctor(a)
+    print()
+    if todo:
+        say("almost done. Remaining steps:")
+        for i, t in enumerate(todo, 1):
+            print(f"  {i}. {t}")
+    say("next: bring a repository in with `abacus add <path>`, or try the demo first: `abacus demo setup` "
+        "(docs/GETTING-STARTED.md)")
+
+
+def cmd_doctor(a):
+    ok = print_prereqs(prereqs())
+    on_path, in_rc, rc = path_state()
+    linked = abacus_link()
+    print(f"  {'ok ' if on_path or in_rc else 'MISSING'}  {'~/.abacus/bin on your PATH':<34} "
+          f"{'yes' if on_path else ('set in ' + str(rc) + ' (new terminals have it)' if in_rc else 'add: ' + PATH_LINE)}")
+    ok = ok and (on_path or in_rc)
+    search = USER_PATH + ("" if on_path or not in_rc else os.pathsep + str(HOME / "bin"))
+    cfg = config()
+    print(f"  {'ok ' if cfg else 'MISSING'}  {'~/.abacus/config.json':<34} {', '.join(workspace_roots()) or 'run abacus install'}")
+    for name, clis in CLIS.items():
+        for cli in clis:
+            p = (str(linked) if cli == "abacus" and linked else None) or \
+                shutil.which(cli, path=search)  # the operator's real PATH (plus the rc line), not the CLI's own
+            print(f"  {'ok ' if p else 'MISSING'}  {cli:<34} {p or 'not on your PATH'}")
+            ok = ok and bool(p)
+    dep = HOME / "agents" / ".deployed"
+    print(f"  {'ok ' if dep.exists() else 'MISSING'}  {'roles deployed':<34} "
+          f"{json.loads(dep.read_text())['commit'][:12] if dep.exists() else 'run abacus install'}")
+    folders = abacus_folders()
+    pending = untrusted(folders)
+    if pending is None:
+        print(f"  {'?':<7}  {'folder trust':<34} can't read ~/.claude.json")
+    else:
+        print(f"  {'ok ' if not pending else 'MISSING'}  {'folders trusted in Claude Code':<34} "
+              f"{len(folders) - len(pending)}/{len(folders)}" + ("" if not pending else "  (run `abacus trust`)"))
+        for f in pending:
+            print(f"           needs trust: {f}")
+        ok = ok and not pending
+    print(f"  {'ok ' if statusline_enabled() else 'info'}  {'status line':<34} "
+          f"{statusline_state()}")
+    top = run(["git", "rev-parse", "--show-toplevel"], check=False)
+    if top.returncode == 0 and (Path(top.stdout.strip()) / ".abacus" / "config.json").exists():
+        print(f"\nThis repository ({top.stdout.strip()}):")
+        r = run(["abacus-doctor"], cwd=top.stdout.strip(), check=False)
+        print(r.stdout.rstrip())
+        ok = ok and r.returncode == 0
+    return 0 if ok and dep.exists() else 1
+
+
+def cmd_trust(a):
+    pending = untrusted(abacus_folders())
+    if pending is None:
+        die("can't read ~/.claude.json to see which folders are trusted")
+    if not pending:
+        say("every Abacus folder is already trusted"); return 0
+    if not sys.stdin.isatty():
+        say("these folders need trusting; run `claude` in each, accept the prompt, then /exit:")
+        for f in pending:
+            print(f"  cd {f} && claude")
+        return 1
+    say(f"{len(pending)} folder(s) to trust. For each one Claude Code opens: accept the trust prompt, then type /exit.")
+    for f in pending:
+        input(f"abacus: press Enter to open {f} ... ")
+        subprocess.call(["claude"], cwd=str(f))
+    left = untrusted(abacus_folders()) or []
+    say("all Abacus folders trusted" if not left else f"still untrusted: {', '.join(map(str, left))}")
+    return 0 if not left else 1
+
+
+# ------------------------------------------------------------------ add a repository
+
+def detect_gates(repo):
+    """(gate, fast_check, where it came from) from the repository's own build files, or (None, None, None)."""
+    repo = Path(repo)
+    mk = repo / "Makefile"
+    targets = set(re.findall(r"^([A-Za-z0-9_-]+):", mk.read_text(), re.M)) if mk.exists() else set()
+    if "gate" in targets:
+        return "make gate", ("make check" if "check" in targets else "make gate"), "Makefile (gate target)"
+    pkg = repo / "package.json"
+    if pkg.exists():
+        try:
+            scripts = json.loads(pkg.read_text()).get("scripts", {})
+        except ValueError:
+            scripts = {}
+        runner = "pnpm" if (repo / "pnpm-lock.yaml").exists() else "yarn" if (repo / "yarn.lock").exists() else "npm"
+        rs = (lambda s: f"{runner} {s}") if runner != "npm" else (lambda s: f"npm run {s}" if s != "test" else "npm test")
+        if "test" in scripts:
+            gate = " && ".join([rs(s) for s in ("lint", "typecheck") if s in scripts] + [rs("test")])
+            fast = next((rs(s) for s in ("lint", "typecheck") if s in scripts), rs("test"))
+            return gate, fast, "package.json scripts"
+    if (repo / "Cargo.toml").exists():
+        return "cargo test", "cargo check", "Cargo.toml"
+    if (repo / "go.mod").exists():
+        return "go vet ./... && go test ./...", "go vet ./...", "go.mod"
+    if list(repo.glob("*.sln")) or list(repo.glob("*.csproj")):
+        return "dotnet test", "dotnet build", ".NET solution"
+    if any((repo / f).exists() for f in ("pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini")):
+        return "python3 -m pytest -q", "python3 -m compileall -q .", "Python project"
+    if "test" in targets:
+        return "make test", ("make check" if "check" in targets else "make test"), "Makefile (test target)"
+    return None, None, None
+
+
+def default_branch(repo):
+    p = run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=repo, check=False)
+    if p.returncode == 0 and "/" in p.stdout:
+        return p.stdout.strip().split("/", 1)[1]
+    return run(["git", "branch", "--show-current"], cwd=repo, check=False).stdout.strip() or "main"
+
+
+def prompt(question, default):
+    if not sys.stdin.isatty():
+        return default
+    try:
+        got = input(f"abacus: {question} [{default}] ").strip()
+    except EOFError:
+        return default
+    return got or default
+
+
+def cmd_add(a):
+    """Bring a repository into Abacus: board, conventions, worker registration, trust. The steps that change your
+    repository's controls (the commit) and Claude Code's safety prompt (trust) ask you first."""
+    for tool in ("bd", "abacus-adopt", "abacus-doctor", "abacus-deploy"):
+        if not shutil.which(tool):
+            die(f"{tool} not found. Run the installer first (and `brew install beads` for bd).")
+    top = run(["git", "-C", str(Path(a.path).expanduser()), "rev-parse", "--show-toplevel"], check=False)
+    if top.returncode != 0:
+        die(f"{a.path} is not inside a git repository")
+    repo = Path(top.stdout.strip()).resolve()
+    if run(["git", "rev-parse", "HEAD"], cwd=repo, check=False).returncode != 0:
+        die(f"{repo} has no commits yet; commit something first")
+    if run(["git", "status", "--porcelain"], cwd=repo, check=False).stdout.strip():
+        die(f"{repo} has uncommitted changes. Commit or stash them first, so the adoption is a diff you can review.")
+    name = (a.name or repo.name).lower()
+    key = f"coder:{name}"
+    fleet_path = HOME / "fleet.json"
+    fleet = json.loads(fleet_path.read_text()) if fleet_path.exists() else {"workers": {}}
+    known = fleet["workers"].get(key)
+    if known and Path(os.path.expanduser(known.get("repo", ""))).resolve() != repo:
+        die(f"{key} is already registered for {known['repo']}; pass --name to choose another worker name")
+    branch = default_branch(repo)
+    say(f"adding {repo} as {key} (default branch {branch})")
+
+    # 1. the board
+    if not (repo / ".beads").is_dir():
+        prefix = a.prefix or re.sub(r"[^a-z0-9]", "", name)[:8] or "work"
+        bd(repo, "init", "--prefix", prefix, "--quiet", "--skip-agents", "--skip-hooks", "--non-interactive")
+        say(f"created its Beads board (bead ids will look like {prefix}-abc)")
+    # 2. the gates: what must pass before every push, and on every commit
+    gate, fast = a.gate, a.fast_check
+    if not gate:
+        g, f, where = detect_gates(repo)
+        if g:
+            say(f"from {where}: gate (before every push) `{g}`; fast check (every commit) `{f}`")
+            if ask("Use these?", a.yes):
+                gate, fast = g, f
+        if not gate:
+            if not sys.stdin.isatty():
+                die("pass --gate '<full test command>' and --fast-check '<quick check>' (couldn't ask: no terminal)")
+            gate = prompt("full test command, run before every push", g or "make test")
+    fast = fast or prompt("quick check, run on every commit", gate)
+    # 3. the conventions (abacus-adopt narrows or refuses a .gitignore that would hide its files)
+    out = run(["abacus-adopt", "--project", name, "--branch", branch, "--gate", gate, "--fast-check", fast],
+              cwd=repo, check=False)
+    if out.returncode != 0:
+        die((out.stderr or out.stdout).strip())
+    changed = [l.strip() for l in out.stdout.splitlines() if l.strip().startswith(("wrote", "changed"))]
+    say(f"adopted Abacus's conventions ({len(changed)} files):")
+    print(run(["git", "status", "--short"], cwd=repo, check=False).stdout.rstrip())
+    # 4. the repository doctor
+    rows = run(["abacus-doctor"], cwd=repo, check=False).stdout.splitlines()
+    adopted = sum(1 for r in rows if r.strip().startswith("ADOPTED"))
+    others = [r.strip() for r in rows if r.strip().startswith(("NOT ADOPTED", "BROKEN", "DEVIATING"))]
+    say(f"repository doctor: {adopted} conventions ADOPTED" + (", and:" if others else ""))
+    for r in others:
+        print(f"  {r}")
+    if any(r.startswith("NOT ADOPTED") and " emit " in f" {r} " for r in others):
+        print("  (emit is expected until the first retro lands)")
+    # 5. register the worker, so the agents can dispatch to it
+    fleet["workers"][key] = {"repo": str(repo), "role": "coder", "model": "sonnet", "permission_mode": "auto",
+                             "prompt": f"You are {key}, an Abacus worker. Run /abacus-worker and wait for dispatches."}
+    fleet_path.write_text(json.dumps(fleet, indent=2) + "\n")
+    dep = run(["abacus-deploy"] + (["--allow-unpublished"] if config().get("dev") else []), check=False)
+    if dep.returncode != 0:
+        die(f"registered {key} but the deploy failed: {(dep.stderr or dep.stdout).strip()}")
+    say(f"registered {key}; the orchestrator can now dispatch work to it")
+    if not any(repo == Path(r) or Path(r) in repo.parents for r in workspace_roots()):
+        say("it's outside your workspace roots; it's still fenced, because every fleet repository is")
+    # 6. commit (it changes the controls that govern agents in this repository, so it's your call)
+    if ask(f"Commit the adoption in {repo.name} (guards, workflows, skills, config)?", a.yes):
+        run(["git", "add", "-A"], cwd=repo)
+        c = run(["git", "commit", "-q", "-m", "Adopt Abacus conventions"], cwd=repo, check=False)
+        if c.returncode != 0:
+            die(f"the commit failed (your fast check runs on commit):\n{(c.stderr or c.stdout).strip()[-1500:]}")
+        say("committed")
+        has_remote = run(["git", "remote"], cwd=repo, check=False).stdout.strip()
+        if has_remote and ask(f"Push it to origin/{branch}? (your gate runs first)", a.yes):
+            p = run(["git", "push", "-q", "origin", branch], cwd=repo, check=False)
+            say("pushed" if p.returncode == 0 else f"the push failed:\n{(p.stderr or p.stdout).strip()[-1500:]}")
+    else:
+        say("left uncommitted: review `git diff`, then commit it yourself")
+    # 7. trust: Claude Code's safety prompt, which only you can accept
+    pending = untrusted([repo] + [f for f in abacus_folders() if f != repo]) or []
+    if repo in pending and ask(f"Open Claude Code in {repo.name} now to trust it? (accept, then /exit)"):
+        subprocess.call(["claude"], cwd=str(repo))
+        pending = untrusted(abacus_folders()) or []
+    if pending:
+        say("still to trust (`abacus trust` opens each): " + ", ".join(map(str, pending)))
+    print(f"""
+Next: `abacus chat`, then tell the concierge what to do in {repo.name}, for example
+      plan <an issue link, or a file describing the work>
+""")
+
+
+# ------------------------------------------------------------------ demo
+# Each scenario's starting files and beads live in demos/<scenario>/ (files per repo, scenario.json for the beads).
+# Setup generates throwaway sandboxes from them under the sandbox root; nothing generated is ever source.
+
+DEMOS = ROOT / "demos"
+
+
+def git(cwd, *args, check=True):
+    return run(["git", *args], cwd=cwd, check=check, env={"GIT_AUTHOR_NAME": "Abacus Demo",
+               "GIT_AUTHOR_EMAIL": "abacus-demo@example.com", "GIT_COMMITTER_NAME": "Abacus Demo",
+               "GIT_COMMITTER_EMAIL": "abacus-demo@example.com"})
+
+
+def write(path, text, mode=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    if mode:
+        path.chmod(mode)
+
+
+def bd(cwd, *args, input=None):
+    p = run(["bd", *args], cwd=cwd, check=False, input=input, env={"BD_NON_INTERACTIVE": "1"})
+    if p.returncode != 0:
+        die(f"`bd {' '.join(args)}` failed in {cwd}:\n{(p.stderr or p.stdout).strip()}")
+    return p.stdout.strip()
+
+
+def scenario_spec(scenario):
+    return json.loads((DEMOS / scenario / "scenario.json").read_text())
+
+
+def fill(text, values):
+    """Replace {name} placeholders (sha, source, and other beads' ids by repo name); other braces stay as written."""
+    for k, v in values.items():
+        text = text.replace("{" + k + "}", str(v))
+    return text
+
+
+def first_message(scenario, beads):
+    """What to tell the concierge first. Naming the beads saves the orchestrator a question back to the operator."""
+    ids = [beads[b["repo"]] for b in scenario_spec(scenario)["beads"] if b["repo"] in beads]
+    if len(ids) == 1:
+        return f"Build {ids[0]}."
+    return f"Build {', then '.join(ids)} which depends on it. I approve that order."
+
+
+def scenario_of(a):
+    return getattr(a, "scenario", None) or "two-repo"
+
+
+def sandbox_root():
+    """Where generated demo sandboxes live: one folder, outside your source, itself a workspace root."""
+    cfg = config()
+    if cfg.get("sandbox_root"):
+        return Path(cfg["sandbox_root"])
+    roots = workspace_roots()
+    if not roots:
+        die("run `abacus install` first")
+    return Path(roots[0]).parent / "abacus-sandboxes"
+
+
+def ensure_sandbox_root():
+    """Create the sandbox root and make it a workspace root, so the repo fence covers every demo in it."""
+    root = sandbox_root()
+    root.mkdir(parents=True, exist_ok=True)
+    cfg = config()
+    roots = cfg.get("workspace_roots") or ([cfg["workspace_root"]] if cfg.get("workspace_root") else [])
+    if str(root) not in roots and not any(Path(r) in root.parents for r in roots):
+        cfg["workspace_roots"] = roots + [str(root)]
+        say(f"added the sandbox folder {root} as a workspace root (the repo fence covers every demo in it)")
+    cfg["sandbox_root"] = str(root)
+    (HOME / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
+    return root
+
+
+def demo_dir(a=None):
+    """--dir, else where this scenario was last set up (if it still exists), else <sandbox root>/<scenario>."""
+    scenario = scenario_of(a)
+    if a is not None and getattr(a, "dir", None):
+        return Path(a.dir).expanduser().resolve()
+    known = config().get("demo_dirs", {}).get(scenario)
+    if known and Path(known).exists():
+        return Path(known)
+    return sandbox_root() / scenario
+
+
+def setup_dir(a):
+    """Setup builds in --dir or the sandbox root; an older sandbox elsewhere is left for you to delete.
+    Replacing a scenario's sandbox (here or elsewhere) archives the previous run first, so nothing reads stale state."""
+    scenario = scenario_of(a)
+    d = Path(a.dir).expanduser().resolve() if getattr(a, "dir", None) else ensure_sandbox_root() / scenario
+    old = config().get("demo_dirs", {}).get(scenario)
+    moved = bool(old) and Path(old) != d and Path(old).exists()
+    if moved:
+        say(f"the {scenario} sandbox now lives in {d}; the old one at {old} is no longer used, delete it when you like")
+    replacing = moved or (getattr(a, "force", False) and d.exists() and any(d.iterdir()))
+    if replacing and not getattr(a, "_archived", False):
+        stop_scenario(scenario, f"{scenario} rebuild")
+        archive_run_state(scenario)
+        a._archived = True
+    return d
+
+
+def inside_a_root(d):
+    roots = [Path(r) for r in workspace_roots()]
+    if not any(d == r or r in d.parents for r in roots):
+        die(f"the demo must live inside a workspace root ({', '.join(map(str, roots)) or 'none; run abacus install'}) "
+            f"so the repo fence applies (got {d}). Add one with `abacus install --workspace ... --workspace {d.parent}`")
+
+
+def prepare_demo_dir(a):
+    for tool in ("bd", "abacus-adopt", "abacus-memory"):
+        if not shutil.which(tool):
+            die(f"{tool} not on PATH. Run `abacus install` (and `brew install beads`) first.")
+    d = setup_dir(a)
+    inside_a_root(d)
+    if d.exists():
+        if not a.force:
+            die(f"{d} exists; `abacus demo reset --scenario {scenario_of(a)}` reruns it, --force recreates it")
+        shutil.rmtree(d)
+    (d / "remotes").mkdir(parents=True)
+    return d
+
+
+def clone_from_template(d, scenario, name, branch="main"):
+    """A local bare remote plus a clone of it, holding the scenario's starting files for this repository."""
+    bare = d / "remotes" / f"{name}.git"
+    git(d, "init", "-q", "--bare", "-b", branch, str(bare))
+    git(d, "clone", "-q", str(bare), name)
+    shutil.copytree(DEMOS / scenario / name, d / name, dirs_exist_ok=True)
+    return d / name
+
+
+def adopt(scenario, repos, name, prefix, gate, fast, branch="main", message="adopt Abacus conventions"):
+    """Board, Abacus conventions and cross-repo board links, committed and pushed together (so the tree is clean)."""
+    repo = repos[name]
+    bd(repo, "init", "--prefix", prefix, "--quiet", "--skip-agents", "--skip-hooks", "--non-interactive")
+    run(["abacus-adopt", "--project", name, "--branch", branch, "--gate", gate, "--fast-check", fast], cwd=repo)
+    for b in scenario_spec(scenario)["beads"]:
+        w = b.get("waits_on")
+        if b["repo"] == name and w:
+            bd(repo, "config", "set", f"external_projects.{w['repo']}", str(repos[w["repo"]]))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", message)
+    git(repo, "push", "-q", "-u", "origin", branch)
+
+
+def file_beads(scenario, repos):
+    """File the scenario's beads in order; later beads can name earlier ones as {repo name}."""
+    spec, ids = scenario_spec(scenario), {}
+    for b in spec["beads"]:
+        repo = repos[b["repo"]]
+        values = {"sha": git(repo, "rev-parse", "--short", "HEAD").stdout.strip(), "source": spec.get("source", ""),
+                  **ids}
+        args = ["create", fill(b["title"], values), "-t", b.get("type", "task"), "-d", fill(b["description"], values),
+                "--acceptance", fill(b["acceptance"], values), "--silent"]
+        if spec.get("source"):
+            args += ["--external-ref", spec["source"]]
+        bead = bd(repo, *args)
+        for label in b.get("labels", []):
+            bd(repo, "label", "add", bead, label)
+        w = b.get("waits_on")
+        if w:
+            # Beads 1.3 records external edges without enforcing them; the logbook's --requires-verified enforces.
+            bd(repo, "dep", "add", bead, f"external:{w['repo']}:{w['capability']}")
+        ids[b["repo"]] = bead
+    return ids
+
+
+def register_demo(scenario, d, repos, beads):
+    """Add the scenario's workers to the fleet, redeploy, and remember where the scenario lives."""
+    fleet_path = HOME / "fleet.json"
+    fleet = json.loads(fleet_path.read_text()) if fleet_path.exists() else {"workers": {}}
+    for name, repo in repos.items():
+        fleet["workers"][f"coder:{name}"] = {
+            "repo": str(repo), "role": "coder", "model": "sonnet", "permission_mode": "auto",
+            "prompt": f"You are coder:{name}, an Abacus worker. Run /abacus-worker and wait for dispatches."}
+    fleet_path.write_text(json.dumps(fleet, indent=2) + "\n")
+    run(["abacus-deploy"] + (["--allow-unpublished"] if config().get("dev") else []))
+    cfg = config()
+    cfg.setdefault("demo_dirs", {})[scenario] = str(d)
+    cfg.setdefault("demo_bead_ids", {})[scenario] = beads
+    cfg.pop("demo_dir", None); cfg.pop("demo_beads", None)  # pre-0.6 keys
+    (HOME / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def describe_beads(scenario, repos, beads):
+    spec = scenario_spec(scenario)
+    return "".join(f"  {b['repo']:<13} {repos[b['repo']]}\n  {'':<13} bead {beads[b['repo']]}: {b['title']}\n"
+                   for b in spec["beads"])
+
+
+def cmd_demo_setup(a):
+    if scenario_of(a) == "heartbeat":
+        return setup_heartbeat(a)
+    if scenario_of(a) == "decision":
+        return setup_decision(a)
+    d = prepare_demo_dir(a)
+    repos = {n: clone_from_template(d, "two-repo", n) for n in ("repo-a", "repo-b")}
+    for name, repo in repos.items():
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", f"{name}: initial MVP")
+    # repo-b vendors the current textkit so it starts green
+    a_sha = git(repos["repo-a"], "rev-parse", "HEAD").stdout.strip()
+    git(repos["repo-a"], "push", "-q", "-u", "origin", "main")
+    run(["sh", "scripts/sync-textkit.sh", a_sha], cwd=repos["repo-b"])
+    git(repos["repo-b"], "add", "-A")
+    git(repos["repo-b"], "commit", "-q", "-m", "vendor textkit")
+    for name in repos:
+        adopt("two-repo", repos, name, name, "make gate", "make check")
+    beads = file_beads("two-repo", repos)
+    run(["abacus-memory", "harvest-me"], cwd=repos["repo-a"])  # shared memory gets the seed retro
+    register_demo("two-repo", d, repos, beads)
+    say(f"demo ready in {d}")
+    print(f"""
+{describe_beads("two-repo", repos, beads)}
+{trust_hint()}Next:
+  abacus demo status                 # doctor both repos (guards, gates, workflows...)
+  abacus demo start                  # start the two workers and the concierge in Agent View
+  abacus chat                        # then tell the concierge, naming both beads:
+      {first_message("two-repo", beads)}
+""")
+
+
+def setup_decision(a):
+    """One repo, one bead whose default behaviour is an open product question the worker must not decide."""
+    d = prepare_demo_dir(a)
+    repos = {"ledger": clone_from_template(d, "decision", "ledger")}
+    git(repos["ledger"], "add", "-A")
+    git(repos["ledger"], "commit", "-q", "-m", "ledger: initial MVP")
+    git(repos["ledger"], "push", "-q", "-u", "origin", "main")
+    adopt("decision", repos, "ledger", "ledger", "make gate", "make check")
+    beads = file_beads("decision", repos)
+    register_demo("decision", d, repos, beads)
+    say(f"decision demo ready in {d}")
+    print(f"""
+{describe_beads("decision", repos, beads)}  The default format (CSV or JSON) is an open product decision for you.
+
+{trust_hint()}Next:
+  abacus demo start --scenario decision   # coder:ledger + the concierge
+  abacus chat                             # then tell the concierge:
+      {first_message("decision", beads)}
+What to expect: the worker refuses to guess the default and asks for a ruling. A NEEDS YOU card appears (the
+concierge tells you, and your status line shows `abacus · 1 needs you`). Answer it in the concierge, e.g.
+"CSV", then the work resumes and is verified.
+""")
+
+
+def trust_hint():
+    pending = untrusted(abacus_folders())
+    if not pending:
+        return ""
+    return ("First, trust these folders once (run `abacus trust`, or `claude` in each and accept):\n"
+            + "".join(f"  {f}\n" for f in pending) + "\n")
+
+
+# ------------------------------------------------------------------ heartbeat: a real two-repo pilot, rerunnable
+
+BASELINE_TAG = "pilot-baseline"
+RUNS_DIR_NAME = ".abacus-runs"
+
+
+def heartbeat_repos():
+    """{name: {branch, prefix, gate, fast}} from demos/heartbeat/scenario.json."""
+    return scenario_spec("heartbeat")["repos"]
+
+
+def heartbeat_sources(a):
+    """Your real checkouts. The sandbox copies their committed HEAD; it never writes to them."""
+    cfg = config()
+    src = dict(cfg.get("heartbeat_sources") or {})
+    for name, flag in (("sdk-internal", "sdk_repo"), ("bwcli-rs", "cli_repo")):
+        if getattr(a, flag, None):
+            src[name] = str(Path(getattr(a, flag)).expanduser().resolve())
+        if not src.get(name):
+            guess = Path(workspace_roots()[0]).parent / "bitwarden" / name if workspace_roots() else None
+            if guess and (guess / ".git").exists():
+                src[name] = str(guess)
+            else:
+                die(f"where is your {name} checkout? pass --{flag.replace('_', '-')} PATH (remembered afterwards)")
+        if not (Path(src[name]) / ".git").exists():
+            die(f"{src[name]} is not a git checkout")
+    cfg["heartbeat_sources"] = src
+    (HOME / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
+    return src
+
+
+def link_sdk_into_worktrees(cli):
+    """The CLI's `../sdk-internal` path dependencies would break inside .claude/worktrees/<bead>/; point them home."""
+    link = cli / ".claude" / "worktrees" / "sdk-internal"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if not link.is_symlink():
+        link.symlink_to("../../../sdk-internal")
+
+
+def stop_scenario(scenario, why):
+    """Stop everything a run left behind, discarding unsaved work: resets throw the run away on purpose."""
+    for s in ["agent:orchestrator", "agent:concierge"] + [f"coder:{r}" for r in SCENARIOS[scenario]["repos"]]:
+        p = run(["abacus-session", "stop", s, "--force-unsaved", "--reason", why], check=False)
+        out = (p.stderr or p.stdout).strip()
+        if p.returncode != 0:
+            say(f"{s}: not stopped: {out.splitlines()[-1] if out else p.returncode}")
+        elif "no live session" not in out:
+            say(f"{s}: stopped")
+
+
+def archive_run_state(scenario):
+    """Keep each run's logbook and orchestrator pages for comparison; the next run starts from empty ones."""
+    state = HOME / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while (state / f"logbook-{scenario}-{n}.db").exists() or (state / "archive" / f"{scenario}-{n}").exists():
+        n += 1
+    lb = state / "logbook.db"
+    had_logbook = lb.exists()
+    if had_logbook:
+        lb.rename(state / f"logbook-{scenario}-{n}.db")
+    run(["abacus-logbook", "init"])
+    pages = HOME / "agents" / "orchestrator" / "pages"
+    moved = [f for f in pages.glob("*.md")] if pages.exists() else []
+    if moved:
+        dest = state / "archive" / f"{scenario}-{n}" / "pages"
+        dest.mkdir(parents=True, exist_ok=True)
+        for f in moved:
+            f.rename(dest / f.name)
+    if had_logbook or moved:
+        say(f"archived the previous run as {scenario}-{n}: " + ", ".join(
+            ([f"state/logbook-{scenario}-{n}.db"] if had_logbook else []) +
+            ([f"{len(moved)} page(s) in state/archive/{scenario}-{n}/"] if moved else [])))
+
+
+def setup_heartbeat(a):
+    for tool in ("bd", "abacus-adopt", "cargo"):
+        if not shutil.which(tool):
+            die(f"{tool} not on PATH")
+    src = heartbeat_sources(a)
+    d = setup_dir(a)
+    inside_a_root(d)
+    built = [d / x for x in ("remotes", "baseline", *heartbeat_repos())]
+    if any(p.exists() for p in built):
+        if not a.force:
+            die(f"{d} already has a heartbeat sandbox. `abacus demo reset --scenario heartbeat` reruns it; "
+                f"--force rebuilds it from your checkouts (the build cache is kept)")
+        for p in built:
+            shutil.rmtree(p, ignore_errors=True)
+    (d / "remotes").mkdir(parents=True, exist_ok=True)
+    # One build folder for both repositories and every worker worktree under them (cargo reads parent configs).
+    write(d / ".cargo" / "config.toml", "# Abacus heartbeat pilot: one shared build folder (kept across resets).\n"
+          f"[build]\ntarget-dir = \"{d / 'target'}\"\n")
+    for name, spec in heartbeat_repos().items():
+        bare = d / "remotes" / f"{name}.git"
+        git(d, "init", "-q", "--bare", "-b", spec["branch"], str(bare))
+        git(bare, "fetch", "-q", src[name], f"HEAD:refs/heads/{spec['branch']}")
+        git(d, "clone", "-q", str(bare), name)
+        say(f"{name}: copied {git(d / name, 'log', '--oneline', '-1').stdout.strip()} from {src[name]}")
+    repos = {n: d / n for n in heartbeat_repos()}
+    for name, spec in heartbeat_repos().items():
+        say(f"{name}: running its gate before the first push (slow on a cold build cache)")
+        adopt("heartbeat", repos, name, spec["prefix"], spec["gate"], spec["fast"], spec["branch"],
+              "Adopt Abacus conventions (heartbeat pilot sandbox)")
+    link_sdk_into_worktrees(d / "bwcli-rs")
+    beads = file_beads("heartbeat", repos)
+    (d / "baseline").mkdir(exist_ok=True)
+    for name in heartbeat_repos():
+        repo = d / name
+        git(repo, "tag", "-f", BASELINE_TAG)
+        git(repo, "push", "-q", "-f", "origin", BASELINE_TAG)
+        bd(repo, "export", "-o", str(d / "baseline" / f"{name}.jsonl"))
+    register_demo("heartbeat", d, repos, beads)
+    say(f"heartbeat pilot ready in {d}")
+    print(heartbeat_next(beads))
+
+
+def heartbeat_next(beads):
+    lines = [f"\n{trust_hint()}Next:", "  abacus demo start --scenario heartbeat   # both workers + the concierge"]
+    if beads:
+        lines += ["  abacus chat                              # then tell the concierge:",
+                  f"      {first_message('heartbeat', beads)}"]
+    else:
+        lines += ["  boards are empty: file the beads for " + scenario_spec("heartbeat")["source"]
+                  + " (/bead-file in each repo)"]
+    lines += ["Rerun later with `abacus demo reset --scenario heartbeat` (add --empty-boards to test filing)."]
+    return "\n".join(lines) + "\n"
+
+
+def reset_heartbeat_repo(d, name, empty_board):
+    repo, spec = d / name, heartbeat_repos()[name]
+    branch, bare = spec["branch"], d / "remotes" / f"{name}.git"
+    if git(repo, "rev-parse", "-q", "--verify", f"refs/tags/{BASELINE_TAG}", check=False).returncode != 0:
+        die(f"{name} has no {BASELINE_TAG} tag; rebuild with `abacus demo setup --scenario heartbeat --force`")
+    # 1. worktrees the run left (Claude Code puts each worker's under .claude/worktrees/)
+    for line in git(repo, "worktree", "list", "--porcelain").stdout.splitlines():
+        if line.startswith("worktree ") and Path(line[9:]).resolve() != repo.resolve():
+            git(repo, "worktree", "remove", "--force", line[9:], check=False)
+    git(repo, "worktree", "prune")
+    # 2. the remote: only the baseline survives
+    base = git(repo, "rev-parse", f"{BASELINE_TAG}^{{commit}}").stdout.strip()
+    for ref in git(bare, "for-each-ref", "--format=%(refname)", "refs/heads").stdout.split():
+        if ref != f"refs/heads/{branch}":
+            git(bare, "update-ref", "-d", ref)
+    git(bare, "update-ref", f"refs/heads/{branch}", base)
+    # 3. the checkout
+    git(repo, "checkout", "-q", "-f", branch)
+    git(repo, "fetch", "-q", "--prune", "origin")
+    git(repo, "reset", "-q", "--hard", base)
+    git(repo, "clean", "-q", "-fd")
+    shutil.rmtree(repo / RUNS_DIR_NAME, ignore_errors=True)
+    for b in git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads").stdout.split():
+        if b != branch:
+            git(repo, "branch", "-q", "-D", b, check=False)
+    # 4. the board: delete everything, then restore the baseline (Beads' import drops external edges; re-add them)
+    ids = [i["id"] for i in json.loads(bd(repo, "list", "--all", "--json") or "[]")]
+    if ids:
+        listing = HOME / "state" / f".reset-{name}.txt"
+        listing.write_text("\n".join(ids) + "\n")
+        bd(repo, "delete", "--from-file", str(listing), "--force")
+        listing.unlink()
+    beads = []
+    if not empty_board:
+        exported = d / "baseline" / f"{name}.jsonl"
+        bd(repo, "import", str(exported))
+        for line in exported.read_text().splitlines():
+            issue = json.loads(line)
+            beads.append(issue["id"])
+            for dep in issue.get("dependencies") or []:
+                if str(dep.get("depends_on_id", "")).startswith("external:"):
+                    bd(repo, "dep", "add", issue["id"], dep["depends_on_id"])
+    return beads
+
+
+def reset_heartbeat(a):
+    d = demo_dir(a)
+    if not all((d / n / ".git").exists() for n in heartbeat_repos()):
+        die(f"no heartbeat sandbox in {d}; create it with `abacus demo setup --scenario heartbeat`")
+    stop_scenario("heartbeat", "heartbeat reset")
+    archive_run_state("heartbeat")
+    beads = {}
+    for name in heartbeat_repos():
+        ids = reset_heartbeat_repo(d, name, a.empty_boards)
+        if ids:
+            beads[name] = ids[0]
+        say(f"{name}: back to {BASELINE_TAG} ({git(d / name, 'log', '--oneline', '-1').stdout.strip()[:60]}); "
+            + ("board emptied" if a.empty_boards else f"board restored ({len(ids)} bead(s))"))
+    link_sdk_into_worktrees(d / "bwcli-rs")
+    cfg = config()
+    cfg.setdefault("demo_bead_ids", {})["heartbeat"] = beads if len(beads) == 2 else {}
+    (HOME / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
+    print(heartbeat_next(beads if len(beads) == 2 else None))
+
+
+def cmd_demo_reset(a):
+    scenario = scenario_of(a)
+    if scenario == "heartbeat":
+        return reset_heartbeat(a)
+    if a.empty_boards:
+        die("--empty-boards applies to the heartbeat scenario only")
+    # Generated demos are cheap to recreate from scratch.
+    stop_scenario(scenario, f"{scenario} reset")
+    archive_run_state(scenario)
+    a.force, a.dir, a._archived = True, None, True
+    return cmd_demo_setup(a)
+
+
+def cmd_demo_start(a):
+    scenario = scenario_of(a)
+    for s in [f"coder:{r}" for r in SCENARIOS[scenario]["repos"]] + ["agent:concierge"]:
+        p = run(["abacus-session", "start", s, "--reason", f"demo start ({scenario})"], check=False)
+        say(f"{s}: " + ("started" if p.returncode == 0 else (p.stderr or p.stdout).strip()))
+    say("talk to Abacus with `abacus chat` (or switch to agent:concierge in `claude agents`); "
+        "the concierge starts the orchestrator when you give it work")
+
+
+def cmd_demo_stop(a):
+    scenario = scenario_of(a)
+    for s in ["agent:orchestrator", "agent:concierge"] + [f"coder:{r}" for r in SCENARIOS[scenario]["repos"]]:
+        p = run(["abacus-session", "stop", s, "--reason", f"demo stop ({scenario})"], check=False)
+        say(f"{s}: " + ("stopped" if p.returncode == 0 else (p.stderr or p.stdout).strip()))
+
+
+def cmd_demo_status(a):
+    d = demo_dir(a)
+    for name in SCENARIOS[scenario_of(a)]["repos"]:
+        print(f"\n== {name}")
+        print(run(["abacus-doctor"], cwd=d / name, check=False).stdout.rstrip())
+    print("\n== logbook")
+    print(run(["abacus-logbook", "digest"], check=False).stdout.rstrip())
+    print("\n== sessions")
+    print(run(["abacus-session", "list"], check=False).stdout.rstrip())
+    cfg = config()
+    beads = cfg.get("demo_bead_ids", {}).get(scenario_of(a)) or (
+        cfg.get("demo_beads") if scenario_of(a) == "two-repo" else None)
+    if beads:
+        print("\n== beads")
+        for repo, bead in beads.items():
+            print(f"  {repo}  {bead}")
+        print(f"\nTell the concierge (abacus chat): {first_message(scenario_of(a), beads)}")
+
+
+# ------------------------------------------------------------------ operator conveniences
+
+def live_session_id(name):
+    """The job id of the running session with exactly this name. Attaching by name is ambiguous: Agent View keeps
+    every stopped session's record, and other sessions' task text can mention the name."""
+    try:
+        sessions = json.loads(run(["claude", "agents", "--json"], check=False).stdout or "[]")
+    except ValueError:
+        return None
+    live = [s for s in sessions if s.get("name") == name and s.get("pid") and s.get("id")]
+    live.sort(key=lambda s: s.get("startedAt") or 0, reverse=True)
+    if len(live) > 1:
+        say(f"{len(live)} {name} sessions are running; attaching to the newest ({live[0]['id']})")
+    return live[0]["id"] if live else None
+
+
+def cmd_chat(a):
+    job = live_session_id("agent:concierge")
+    if not job:
+        p = run(["abacus-session", "start", "agent:concierge"], check=False)
+        if p.returncode != 0:
+            die((p.stderr or p.stdout).strip())
+        say("started agent:concierge")
+        for _ in range(20):
+            job = live_session_id("agent:concierge")
+            if job:
+                break
+            time.sleep(1)
+        if not job:
+            die("agent:concierge started but doesn't show in Agent View yet; try `abacus chat` again in a moment")
+    os.execvp("claude", ["claude", "attach", job])
+
+
+def cmd_prune(a):
+    args = ["abacus-session", "prune", "--keep", str(a.keep)] + (["--dry-run"] if a.dry_run else [])
+    os.execvp("abacus-session", args)
+
+
+def cmd_status(a):
+    os.execvp("abacus-status", ["abacus-status"])
+
+
+CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
+STATUSLINE = {"type": "command", "command": str(HOME / "bin" / "abacus-status") + " --line"}
+WRAPPED_COMMAND = str(HOME / "bin" / "abacus-status") + " --line --wrap"
+
+
+def abacus_statusline(sl):
+    return isinstance(sl, dict) and sl.get("command") in (STATUSLINE["command"], WRAPPED_COMMAND)
+
+
+def cmd_statusline(a):
+    settings = json.loads(CLAUDE_SETTINGS.read_text()) if CLAUDE_SETTINGS.exists() else {}
+    backup = HOME / "state" / "statusline.backup.json"
+    current = settings.get("statusLine")
+    if a.action == "enable":
+        if abacus_statusline(current):
+            say("the Abacus status line is already enabled"); return 0
+        wrap = bool(current) and getattr(a, "wrap", False)
+        if current and not (a.replace or wrap):
+            die(f"you already have a status line ({json.dumps(current)}). Choose one:\n"
+                f"  abacus statusline enable --wrap      keep yours and append Abacus's state to it (recommended)\n"
+                f"  abacus statusline enable --replace   show only Abacus's\n"
+                f"  or add `$({STATUSLINE['command']})` to your own status-line script yourself\n"
+                f"Either flag backs yours up, and `abacus statusline disable` restores it.")
+        if wrap and not current.get("command"):
+            die(f"your status line has no command to wrap ({json.dumps(current)}); use --replace instead")
+        if current:
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            backup.write_text(json.dumps(current))
+        # wrapping keeps your other settings (padding, refreshInterval) and runs your command inside Abacus's
+        settings["statusLine"] = dict(current, command=WRAPPED_COMMAND) if wrap else STATUSLINE
+        CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+        CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
+        say(f"status line enabled in {CLAUDE_SETTINGS}; new Claude Code sessions will show it")
+    else:
+        if not abacus_statusline(current):
+            say("the Abacus status line is not enabled; nothing changed"); return 0
+        if backup.exists():
+            settings["statusLine"] = json.loads(backup.read_text())
+            backup.unlink()
+        else:
+            settings.pop("statusLine", None)
+        CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
+        say("status line disabled (previous status line restored if there was one)")
+    return 0
+
+
+def main(argv=None):
+    # Never depend on the operator's shell PATH for Abacus's own tools.
+    os.environ["PATH"] = f"{HOME / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv[:1] in (["--version"], ["-V"]):
+        print_version()
+        return 0
+    p = argparse.ArgumentParser(prog="abacus", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    i = sub.add_parser("install")
+    i.add_argument("--workspace", action="append", metavar="DIR",
+                   help="a directory containing your repositories (repo-fence boundary); repeat for several")
+    i.add_argument("--components-dir", help="where abacus-infra/standards/orchestrator are cloned")
+    i.add_argument("--dev", action="store_true", help="link working trees instead of publishing committed HEAD")
+    i.add_argument("--skip-prereqs", action="store_true")
+    i.add_argument("--yes", action="store_true", help="accept every offer (install Beads, PATH line, status line)")
+    sub.add_parser("doctor"); sub.add_parser("trust")
+    ad = sub.add_parser("add", help="bring a repository into Abacus")
+    ad.add_argument("path", nargs="?", default=".")
+    ad.add_argument("--gate", help="full test command, run before every push (detected if omitted)")
+    ad.add_argument("--fast-check", help="quick check, run on every commit")
+    ad.add_argument("--name", help="worker name (default: the folder name, lowercased)")
+    ad.add_argument("--prefix", help="bead id prefix for a new board")
+    ad.add_argument("--yes", action="store_true", help="accept the detected gates, the commit and the push")
+    d = sub.add_parser("demo").add_subparsers(dest="demo_cmd", required=True)
+    for verb in ("setup", "start", "stop", "status", "reset"):
+        s = d.add_parser(verb)
+        s.add_argument("--scenario", choices=sorted(SCENARIOS), default="two-repo",
+                       help="two-repo (default): a cross-repository dependency; decision: needs your ruling; "
+                            "heartbeat: real code, sandbox copies of sdk-internal and bwcli-rs")
+        if verb == "setup":
+            s.add_argument("--dir"); s.add_argument("--force", action="store_true")
+            s.add_argument("--sdk-repo", help="heartbeat: your sdk-internal checkout (remembered)")
+            s.add_argument("--cli-repo", help="heartbeat: your bwcli-rs checkout (remembered)")
+        if verb == "reset":
+            s.add_argument("--empty-boards", action="store_true",
+                           help="heartbeat: start with no beads filed, to test filing")
+    sub.add_parser("chat"); sub.add_parser("status")
+    pr = sub.add_parser("prune"); pr.add_argument("--keep", type=int, default=1); pr.add_argument("--dry-run", action="store_true")
+    sl = sub.add_parser("statusline"); sl.add_argument("action", choices=("enable", "disable"))
+    how = sl.add_mutually_exclusive_group()
+    how.add_argument("--wrap", action="store_true", help="keep the status line you already have and append to it")
+    how.add_argument("--replace", action="store_true", help="replace a status line you already have (backed up)")
+    a = p.parse_args(argv)
+    if a.cmd == "install":
+        return cmd_install(a)
+    if a.cmd == "doctor":
+        return cmd_doctor(a)
+    if a.cmd == "add":
+        return cmd_add(a)
+    if a.cmd in ("chat", "status", "statusline", "trust", "prune"):
+        return {"chat": cmd_chat, "status": cmd_status, "statusline": cmd_statusline, "trust": cmd_trust,
+                "prune": cmd_prune}[a.cmd](a)
+    return {"setup": cmd_demo_setup, "start": cmd_demo_start, "stop": cmd_demo_stop,
+            "status": cmd_demo_status, "reset": cmd_demo_reset}[a.demo_cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

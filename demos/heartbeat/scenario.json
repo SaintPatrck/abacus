@@ -1,0 +1,45 @@
+{
+  "about": "real code: sandbox copies of your sdk-internal and bwcli-rs, adding `bw heartbeat`",
+  "source": "https://github.com/dasien/bwcli-rs/issues/1",
+  "repos": {
+    "sdk-internal": {
+      "branch": "main",
+      "prefix": "sdk",
+      "gate": "cargo fmt -p bitwarden-core --check && cargo clippy -q -p bitwarden-core --all-features --all-targets -- -D warnings && cargo test -q -p bitwarden-core --all-features",
+      "fast": "cargo check -q -p bitwarden-core --all-features"
+    },
+    "bwcli-rs": {
+      "branch": "master",
+      "prefix": "bwcli",
+      "gate": "cargo test -q --workspace",
+      "fast": "cargo check -q --workspace"
+    }
+  },
+  "beads": [
+    {
+      "repo": "sdk-internal",
+      "title": "Add PlatformClient::heartbeat() returning the current UTC date and time",
+      "type": "feature",
+      "description": "FILED AGAINST: {sha}\nSOURCE: {source}\n\nThe Rust CLI (bwcli-rs) is adding `bw heartbeat`, which prints the current date and time. The time must come from\nthe SDK, so the CLI exercises a real SDK call. This bead is the SDK half: a public heartbeat method on bitwarden-core\nthat returns the current date and time to the caller.\n\nWhere it fits: `client.platform()` (crates/bitwarden-core/src/platform/platform_client.rs) already hosts small\nutility calls such as `fingerprint`, so `client.platform().heartbeat()` is the natural home. Return a\n`chrono::DateTime<chrono::Utc>` (chrono is already a bitwarden-core dependency). It needs no login, network or state.\n\nConsumer: bwcli-rs bead (filed next) waits on this one and calls the method once it is verified on origin/main.\n\nOut of scope: uniffi/wasm bindings, any other crate, changes to existing PlatformClient methods.",
+      "acceptance": "- `grep -n \"pub fn heartbeat\" crates/bitwarden-core/src/platform/platform_client.rs` shows a public `heartbeat` method on `PlatformClient` returning `chrono::DateTime<chrono::Utc>`\n- a unit test in bitwarden-core asserts the returned time is no earlier than a `Utc::now()` taken before the call and no later than one taken after it\n- the gate passes: `cargo fmt -p bitwarden-core --check && cargo clippy -q -p bitwarden-core --all-features --all-targets -- -D warnings && cargo test -q -p bitwarden-core --all-features`\n- `git diff --stat origin/main...HEAD` lists files under `crates/bitwarden-core/` only",
+      "labels": [
+        "pipeline:lite",
+        "export:heartbeat"
+      ]
+    },
+    {
+      "repo": "bwcli-rs",
+      "title": "Add bw heartbeat: print the current date and time from the SDK",
+      "type": "feature",
+      "description": "FILED AGAINST: {sha}\nSOURCE: {source}\nWAITS-ON sdk-internal:{sdk-internal} (verified on sdk-internal origin/main, and the ../sdk-internal checkout is at that commit)\n\nAdd a `heartbeat` command: `bw heartbeat` prints the current date and time, obtained from the SDK's\n`client.platform().heartbeat()` (added by {sdk-internal}), not computed in the CLI. It exists to prove a change can flow\nfrom the SDK to the CLI.\n\nWhere it fits: a new variant in `Commands` (crates/bw-cli/src/main.rs) with an `execute_heartbeat` in\ncrates/bw-cli/src/commands/, dispatched like `status`. It needs no account, session or unlocked vault, so it belongs\nwith `Status` in the `Need::Nothing` arm of `Requires for Commands`. `tools.rs` already shows how a command\nconstructs a `bitwarden_core::Client` without logging in.\n\nThe SDK is a path dependency (`../sdk-internal`), so this builds against whatever the sdk-internal checkout holds.\nStart only once that checkout contains {sdk-internal}'s verified commit; if `heartbeat` is missing from PlatformClient,\nstop and report BLOCKED rather than adding it here.\n\nOut of scope: `--response` JSON output, changes to other commands, the existing clippy and rustfmt warnings.",
+      "acceptance": "- with no account or session configured, `cargo run -q -p bw-cli --bin bw -- heartbeat` exits 0 and prints one line that parses as an RFC 3339 date-time within 60 seconds of the current time\n- `grep -rn \"platform().heartbeat()\" crates/bw-cli/src` finds the SDK call, and the heartbeat command code contains no `Utc::now` or `SystemTime::now`\n- `bw heartbeat` is in the `Need::Nothing` arm of `Requires for Commands` in crates/bw-cli/src/main.rs\n- crates/bw-cli/tests/integration_test.rs has a test running `bw heartbeat` that asserts exit 0 and an RFC 3339 line, and `cargo test -q --workspace` passes",
+      "labels": [
+        "pipeline:lite"
+      ],
+      "waits_on": {
+        "repo": "sdk-internal",
+        "capability": "heartbeat"
+      }
+    }
+  ]
+}

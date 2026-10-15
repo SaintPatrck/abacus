@@ -1,0 +1,30 @@
+{
+  "about": "one bead in repo-a unblocks one in repo-b across the repository boundary",
+  "beads": [
+    {
+      "repo": "repo-a",
+      "title": "Add word_count(text) to textkit",
+      "type": "feature",
+      "description": "FILED AGAINST: {sha}\n\nConsumers need a word count. Add `word_count(text) -> int` to textkit/core.py: words are whitespace-separated tokens; empty text is 0.",
+      "acceptance": "- `make gate` passes and tests/test_core.py includes a word_count test with an empty-string case\n- `python3 -c \"from textkit.core import word_count; print(word_count('a b  c'))\"` prints 3\n- README.md lists word_count under API",
+      "labels": [
+        "pipeline:lite",
+        "export:word-count"
+      ]
+    },
+    {
+      "repo": "repo-b",
+      "title": "Add --words to wc-report using textkit.word_count",
+      "type": "feature",
+      "description": "FILED AGAINST: {sha}\n\nWAITS-ON repo-a:{repo-a} (verified commit on repo-a origin/main)\n\nAdd a `--words` flag that prints `<n> words` using textkit.word_count. Re-vendor textkit with `make sync-textkit REV=<verified repo-a commit>` first; never vendor an unverified commit.",
+      "acceptance": "- vendor.json pins textkit to a repo-a commit that is on repo-a origin/main and contains word_count\n- `python3 -m wcreport --words README.md` prints `<n> words` where n matches textkit.word_count\n- `make gate` passes with a test for --words",
+      "labels": [
+        "pipeline:lite"
+      ],
+      "waits_on": {
+        "repo": "repo-a",
+        "capability": "word-count"
+      }
+    }
+  ]
+}

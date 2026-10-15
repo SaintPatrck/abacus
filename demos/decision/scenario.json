@@ -1,0 +1,15 @@
+{
+  "about": "a bead with an open product question, so the operator has to make a decision",
+  "beads": [
+    {
+      "repo": "ledger",
+      "title": "Add an export command (default format is an open product decision)",
+      "type": "feature",
+      "description": "FILED AGAINST: {sha}\n\nAdd `python3 -m ledger export` that prints every entry, plus `--format csv|json` to choose explicitly.\n\nOPEN PRODUCT DECISION: which format is the default when `--format` is omitted, CSV (spreadsheet-friendly: amount,description with a header row) or JSON (tooling-friendly: the entries as a JSON array)? This is the operator's call, not an engineering one. Do not choose it yourself. Before building anything, report RULING-NEEDED with both options, a pro and a con for each, and your recommendation. Build only after the ruling is recorded on this bead.",
+      "acceptance": "- `python3 -m ledger export` (no --format) prints all entries in the default format the operator ruled on, as recorded in a JUDGEMENT row on this bead\n- `python3 -m ledger export --format csv` prints a header row then one amount,description line per entry\n- `python3 -m ledger export --format json` prints the entries as a JSON array\n- `make gate` passes with tests covering both formats and the default",
+      "labels": [
+        "pipeline:lite"
+      ]
+    }
+  ]
+}
