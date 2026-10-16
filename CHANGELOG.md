@@ -4,6 +4,14 @@ One version for all four Abacus repositories (`abacus`, `abacus-standards`, `aba
 Bug fixes bump the patch number, features bump the minor number, and the major number changes only when the
 operator decides it. See [docs/INSTALL.md](docs/INSTALL.md#versions).
 
+## 0.8.3 (2026-10-15)
+- **A crashing guard refuses instead of allowing.** Claude Code treats a hook's exit 1 as non-blocking, so an
+  unexpected error in `guards.py` (a payload without `tool_input`, `bd` missing for the planner) used to let the
+  call through. Any crash is now an `abacus-guards` refusal with exit 2, logged like any other.
+- **A failed `abacus-finalize` push can simply be retried.** When the push or the trailer check refuses, finalize
+  undoes the commit it just made, so the changes stay staged and the bead stays open. Running the same command
+  again works, where before it refused with "nothing to commit". `--record` does the same.
+
 ## 0.8.2 (2026-10-14)
 - **Install hints fit your platform.** When a prerequisite is missing, the installer and `abacus doctor` suggest
   `xcode-select` on macOS, your package manager on Linux (apt, dnf, yum, pacman, zypper or apk), and WSL on
