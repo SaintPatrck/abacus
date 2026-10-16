@@ -57,6 +57,7 @@ def say(msg):
 
 
 def die(msg):
+    sys.stdout.flush()  # what was already said comes first, even when output is piped
     print(f"abacus: ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
 
