@@ -1,13 +1,10 @@
 # Abacus
 
-**Orchestrated multi-agent development at Bitwarden.**
+**Orchestrated multi-agent development**
 
 Abacus is a reference implementation of an orchestrated development pattern. 
 It's built on Claude Code's Dynamic Workflows, Agent View and cross-session messaging, with Beads as
 the system of record.
-
-> The name: an abacus is beads on rods. Each rod is a repository, each bead a unit of agent-executable work,
-> and the frame keeps the count honest.
 
 Abacus has four parts:
 
