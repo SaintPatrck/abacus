@@ -8,6 +8,7 @@
 - **Verify that a consumer pins the producer version the orchestrator verified.** A read-only `--check` covers a pin
   today. A general check should be designed against a real multi-repository case.
 - **Calibrate shared memory** once real repositories feed it (`abacus-memory calibrate`).
+- **Use the plugins a team already has.** Teams often publish Claude Code plugins that encode their conventions, such as Bitwarden's `bitwarden-delivery-tools`, which composes PR titles, template bodies and labels. Workers should call those skills so a draft PR follows the team's rules without Abacus keeping its own copy of them.
 
 ## Deliberately not built yet
 - **Periodic inspection**: a weekly review of what escaped, a monthly audit of decisions and rules, a quarterly
