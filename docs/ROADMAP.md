@@ -1,10 +1,6 @@
 # Roadmap and known limits
 
 ## Next
-- **Build ends at a draft PR.** Today a worker's finishing step pushes straight to the repository's default branch.
-  That's fine for the demos' local remotes, and not for a shared repository. Next, `abacus-finalize` pushes a branch
-  per bead and opens a draft PR, verification checks the PR's head commit, and a consumer in another repository
-  builds against its producer's PR branch. Merging stays with people.
 - **Fewer trips to the terminal.** Day to day, you should only need the concierge. Bringing a repository in is one
   command now (`abacus add`); next it becomes a conversation ("add ~/Source/repos/server to Abacus") that proposes
   the adoption for you to confirm, using the same steps.
@@ -30,8 +26,8 @@ deduplicated, so a repeat shows up as a note on one bead rather than a new one. 
 a shared Beads remote is set up (`bd dolt push`).
 
 ## Known limits (be honest about these)
-- **A build pushes to the default branch** until the draft-PR change above lands. Use Abacus on sandboxes or
-  repositories where that's acceptable.
+- **Push mode pushes straight to the default branch.** It suits sandboxes and the demos' local remotes. On a shared
+  repository, set `"landing": "draft-pr"` so each bead ends at a draft PR ([Draft-PR landing](DRAFT-PR-LANDING.md)).
 - **Cross-repository dependencies are recorded on the boards, but enforced by the logbook.** Beads 1.3 stores
   `external:<project>:<capability>` edges and `bd ship` marks capabilities delivered. With separate embedded
   databases, `bd ready` doesn't treat unshipped external edges as blocking. Abacus records the edge for visibility,

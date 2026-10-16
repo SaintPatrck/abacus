@@ -4,6 +4,16 @@ One version for all four Abacus repositories (`abacus`, `abacus-standards`, `aba
 Bug fixes bump the patch number, features bump the minor number, and the major number changes only when the
 operator decides it. See [docs/INSTALL.md](docs/INSTALL.md#versions).
 
+## 0.9.0 (2026-10-16)
+- **A build can end at a draft PR.** With `"landing": "draft-pr"` in a repository's `.abacus/config.json`, each
+  bead lands on its own branch, `abacus/<slug>-<bead-id>`, and closes when `abacus-finalize` opens its draft PR.
+  A bead whose dependency still has an open PR stacks on that dependency's branch, and `abacus-verify` checks that
+  the commit is the head of the bead's PR. Merging stays with people. The default, `"landing": "push"`, pushes
+  straight to the default branch, and any other value is a config error. See
+  [docs/DRAFT-PR-LANDING.md](docs/DRAFT-PR-LANDING.md).
+- **An end-to-end guide.** [docs/END-TO-END.md](docs/END-TO-END.md) follows the path from install to results, with
+  diagrams of the whole path and of a typical "plan, then build" request, and links each step to its details.
+
 ## 0.8.3 (2026-10-15)
 - **A crashing guard refuses instead of allowing.** Claude Code treats a hook's exit 1 as non-blocking, so an
   unexpected error in `guards.py` (a payload without `tool_input`, `bd` missing for the planner) used to let the
