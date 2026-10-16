@@ -13,6 +13,9 @@ operator decides it. See [docs/INSTALL.md](docs/INSTALL.md#versions).
   [docs/DRAFT-PR-LANDING.md](docs/DRAFT-PR-LANDING.md).
 - **An end-to-end guide.** [docs/END-TO-END.md](docs/END-TO-END.md) follows the path from install to results, with
   diagrams of the whole path and of a typical "plan, then build" request, and links each step to its details.
+- **Commits carry no attribution trailer.** `abacus-finalize` no longer adds `Co-Authored-By: Claude` to bead and
+  record commits, so each repository keeps its own attribution policy, including shared ones where those commits
+  land in reviewed PRs.
 
 ## 0.8.3 (2026-10-15)
 - **A crashing guard refuses instead of allowing.** Claude Code treats a hook's exit 1 as non-blocking, so an
