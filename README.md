@@ -53,6 +53,7 @@ The full walkthrough is in [docs/DEMO.md](docs/DEMO.md).
 abacus chat                 # open the concierge (starts it if needed); also reachable from `claude agents`
 abacus status               # what needs you, what's running, what finished
 abacus statusline enable    # show that in every Claude Code session's status line (--wrap keeps yours)
+abacus update               # get the latest Abacus (--check shows what's new first)
 ```
 Tell the concierge what you want, in plain language. Behind the scenes it maps your request onto a few defined acts,
 and asks you when it can't tell which you mean:

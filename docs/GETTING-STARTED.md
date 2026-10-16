@@ -81,6 +81,7 @@ Ask the concierge "what's going on?" any time. With the status line on, every Cl
 | plan new work | tell the concierge "plan <issue link or file path>"; you review the drafts there |
 | watch a worker | `claude agents` → pick `coder:repo-a` (`/workflows` shows the current stage) |
 | stop everything | `abacus demo stop` |
+| get the latest Abacus | `abacus update` (`--check` shows what's new first) |
 
 Next: try the decision demo (`abacus demo setup --scenario decision`), where a worker stops to ask you a product
 question; see [DEMO.md](DEMO.md#5-the-decision-demo). [DEMO.md](DEMO.md) also explains what happened at each step,

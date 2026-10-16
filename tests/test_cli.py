@@ -1,4 +1,5 @@
 import json
+import shutil
 import os
 import subprocess
 import sys
@@ -496,3 +497,98 @@ class InstallHintTest(unittest.TestCase):
     def test_beads_uses_homebrew_only_when_it_exists(self):
         self.assertTrue(self.hint("bd", "darwin", have=("brew",)).startswith("brew install beads"))
         self.assertEqual(self.hint("bd", "linux"), "npm install -g @beads/bd")
+
+
+class UpdateTest(unittest.TestCase):
+    """0.9.0: `abacus update` fetches each clone from its configured source and fast-forwards, then publishes."""
+
+    @classmethod
+    def setUpClass(cls):
+        from importlib.machinery import SourceFileLoader
+        cls.cli = SourceFileLoader("abacus_cli_update", str(CLI)).load_module()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = self.t = Path(self.tmp.name).resolve()
+        (t / "up").mkdir(); (t / "src").mkdir(); (t / "ws").mkdir()
+        here = CLI.parents[2]
+        self.git = lambda cwd, *a: subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True,
+                                                  text=True).stdout.strip()
+        for name in ("abacus", "abacus-standards", "abacus-infra", "abacus-agents"):
+            self.git(t, "clone", "-q", "--bare", "--branch", "main", str(here / name), str(t / "up" / f"{name}.git"))
+            self.git(t / "src", "clone", "-q", str(t / "up" / f"{name}.git"), name)
+        # run the code under test: the working tree's CLI and sources.json, inside the throwaway clone (never the
+        # real working tree, which `update` would fast-forward)
+        for f in ("bin/abacus", "sources.json"):
+            shutil.copy2(CLI.parents[1] / f, t / "src" / "abacus" / f)
+        self.env = dict(os.environ, HOME=str(t), ABACUS_HOME=str(t / ".abacus"), ABACUS_NO_PATH_LINK="1",
+                        ABACUS_NO_RESTART="1")
+        p = self.abacus("install", "--dev", "--skip-prereqs", "--workspace", str(t / "ws"))
+        assert p.returncode == 0, p.stdout + p.stderr
+        cfg_path = t / ".abacus" / "config.json"
+        cfg = json.loads(cfg_path.read_text())
+        cfg["sources"] = {n: {"url": str(t / "up" / f"{n}.git"), "branch": "main"}
+                          for n in ("abacus", "abacus-standards", "abacus-infra", "abacus-agents")}
+        cfg_path.write_text(json.dumps(cfg))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def abacus(self, *args):
+        cli = self.t / "src" / "abacus" / "bin" / "abacus"
+        return subprocess.run([sys.executable, str(cli), *args], env=self.env, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL)
+
+    def publish_upstream_change(self):
+        work = self.t / "work"
+        self.git(self.t, "clone", "-q", str(self.t / "up" / "abacus.git"), "work")
+        self.git(work, "config", "user.email", "t@example.com"); self.git(work, "config", "user.name", "t")
+        ch = work / "CHANGELOG.md"
+        text = ch.read_text()
+        i = text.index("\n## ")
+        ch.write_text(text[:i + 1] + "## 9.9.9 (test)\n- a brand new thing\n\n" + text[i + 1:])
+        self.git(work, "commit", "-q", "-am", "Release 9.9.9")
+        self.git(work, "push", "-q", "origin", "main")
+        return self.git(work, "rev-parse", "HEAD")
+
+    def test_check_shows_whats_new_and_changes_nothing(self):
+        before = self.git(self.t / "src" / "abacus", "rev-parse", "HEAD")
+        self.publish_upstream_change()
+        p = self.abacus("update", "--check")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("abacus: 1 new commit(s)", p.stdout)
+        self.assertIn("Release 9.9.9", p.stdout)
+        self.assertIn("a brand new thing", p.stdout)
+        self.assertEqual(self.git(self.t / "src" / "abacus", "rev-parse", "HEAD"), before)
+
+    def test_update_fast_forwards_and_publishes(self):
+        new = self.publish_upstream_change()
+        p = self.abacus("update")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.git(self.t / "src" / "abacus", "rev-parse", "HEAD"), new)
+        self.assertIn("updated to abacus", p.stdout)
+        self.assertIn("roles deployed", p.stdout)
+        p = self.abacus("update")                                           # nothing new now
+        self.assertIn("abacus: up to date", p.stdout)
+
+    def test_local_commits_stop_the_update_before_anything_changes(self):
+        clone = self.t / "src" / "abacus-infra"
+        self.git(clone, "config", "user.email", "t@example.com"); self.git(clone, "config", "user.name", "t")
+        (clone / "NOTES.md").write_text("mine\n")
+        self.git(clone, "add", "-A"); self.git(clone, "commit", "-q", "-m", "local work")
+        before = self.git(self.t / "src" / "abacus", "rev-parse", "HEAD")
+        self.publish_upstream_change()
+        p = self.abacus("update")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("abacus-infra: has 1 local commit(s)", p.stdout + p.stderr)
+        self.assertIn("nothing was changed", p.stderr)
+        self.assertEqual(self.git(self.t / "src" / "abacus", "rev-parse", "HEAD"), before)
+
+    def test_sources_and_remote_matching(self):
+        self.assertEqual(self.cli.repo_id("git@github.com:dasien/abacus.git"),
+                         self.cli.repo_id("https://github.com/dasien/abacus"))
+        self.assertNotEqual(self.cli.repo_id("https://github.com/dasien/abacus.git"),
+                            self.cli.repo_id("https://github.com/someone-else/abacus.git"))
+        shipped = json.loads((CLI.parents[1] / "sources.json").read_text())["repos"]
+        self.assertEqual(shipped["abacus-agents"]["url"], "https://github.com/dasien/abacus-agents.git")
+        self.assertEqual({v["branch"] for v in shipped.values()}, {"main"})

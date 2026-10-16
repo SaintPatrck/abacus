@@ -1,0 +1,9 @@
+{
+  "_comment": "Where `abacus update` gets each repository. A fork for its own users edits this file; a user can override any entry under \"sources\" in ~/.abacus/config.json.",
+  "repos": {
+    "abacus": {"url": "https://github.com/dasien/abacus.git", "branch": "main"},
+    "abacus-standards": {"url": "https://github.com/dasien/abacus-standards.git", "branch": "main"},
+    "abacus-infra": {"url": "https://github.com/dasien/abacus-infra.git", "branch": "main"},
+    "abacus-agents": {"url": "https://github.com/dasien/abacus-agents.git", "branch": "main"}
+  }
+}
