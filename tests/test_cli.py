@@ -151,7 +151,8 @@ class VersionAndInstallTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name).resolve()
-        self.env = dict(os.environ, HOME=str(self.home), ABACUS_HOME=str(self.home / ".abacus"), ABACUS_NO_PATH_LINK="1")
+        self.env = dict(os.environ, HOME=str(self.home), ABACUS_HOME=str(self.home / ".abacus"),
+                        ABACUS_NO_PATH_LINK="1")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -303,7 +304,8 @@ class RenameTest(unittest.TestCase):
                 cli.find_components(base)
             p = subprocess.run([sys.executable, "-c",
                                 f"import sys; from importlib.machinery import SourceFileLoader as L; "
-                                f"c = L('x', {str(CLI)!r}).load_module(); c.find_components(__import__('pathlib').Path({t!r}))"],
+                                f"c = L('x', {str(CLI)!r}).load_module(); "
+                                f"c.find_components(__import__('pathlib').Path({t!r}))"],
                                capture_output=True, text=True)
             self.assertIn("was renamed abacus-agents in 0.4.0", p.stderr)
 

@@ -326,7 +326,8 @@ def cmd_install(a):
     rows = prereqs()
     if not print_prereqs(rows) and not a.skip_prereqs:
         missing = [name for name, ok, _, _ in rows if not ok]
-        if missing == ["bd"] and shutil.which("brew") and ask("Beads (bd) is missing. Install it now with `brew install beads`?", a.yes):
+        if missing == ["bd"] and shutil.which("brew") and ask("Beads (bd) is missing. "
+                                                              "Install it now with `brew install beads`?", a.yes):
             if subprocess.call(["brew", "install", "beads"]) != 0 or not shutil.which("bd"):
                 die("`brew install beads` did not succeed; install Beads and re-run")
         else:
@@ -366,7 +367,8 @@ def publish_and_deploy(comps, roots, dev):
                 link.unlink()
             link.symlink_to(HOME / "lib" / name / "bin" / cli)
     cfg = config()
-    cfg.update({"workspace_root": str(roots[0]), "workspace_roots": [str(r) for r in roots], "standards_path": str(HOME / "lib" / "abacus-standards"),
+    cfg.update({"workspace_root": str(roots[0]), "workspace_roots": [str(r) for r in roots],
+                "standards_path": str(HOME / "lib" / "abacus-standards"),
                 "components": {k: str(v) for k, v in comps.items()}, "dev": bool(dev)})
     (HOME / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
     env = {"PATH": f"{HOME / 'bin'}:{os.environ['PATH']}"}
@@ -450,7 +452,8 @@ def finish_setup(a):
                 cmd_statusline(argparse.Namespace(action="enable", replace=False, wrap=True))
             else:
                 todo.append("optional: `abacus statusline enable --wrap` to add Abacus's state to your status line")
-        elif ask("Show Abacus state in every Claude Code session's status line (edits ~/.claude/settings.json)?", a.yes):
+        elif ask("Show Abacus state in every Claude Code session's status line "
+                 "(edits ~/.claude/settings.json)?", a.yes):
             cmd_statusline(argparse.Namespace(action="enable", replace=False, wrap=False))
         else:
             todo.append("optional: `abacus statusline enable` to see Abacus state in every Claude Code session")
@@ -474,12 +477,15 @@ def cmd_doctor(a):
     ok = print_prereqs(prereqs())
     on_path, in_rc, rc = path_state()
     linked = abacus_link()
+    path_note = 'yes' if on_path else ('set in ' + str(rc) + ' (new terminals have it)' if in_rc
+                                       else 'add: ' + PATH_LINE)
     print(f"  {'ok ' if on_path or in_rc else 'MISSING'}  {'~/.abacus/bin on your PATH':<34} "
-          f"{'yes' if on_path else ('set in ' + str(rc) + ' (new terminals have it)' if in_rc else 'add: ' + PATH_LINE)}")
+          f"{path_note}")
     ok = ok and (on_path or in_rc)
     search = USER_PATH + ("" if on_path or not in_rc else os.pathsep + str(HOME / "bin"))
     cfg = config()
-    print(f"  {'ok ' if cfg else 'MISSING'}  {'~/.abacus/config.json':<34} {', '.join(workspace_roots()) or 'run abacus install'}")
+    print(f"  {'ok ' if cfg else 'MISSING'}  {'~/.abacus/config.json':<34} "
+          f"{', '.join(workspace_roots()) or 'run abacus install'}")
     for name, clis in CLIS.items():
         for cli in clis:
             p = (str(linked) if cli == "abacus" and linked else None) or \
@@ -573,12 +579,14 @@ def cmd_update(a):
                 run(["git", "remote", "set-url", "origin", s["url"]], cwd=clone)
         f = run(["git", "fetch", "-q", s["url"], s["branch"]], cwd=clone, check=False)
         if f.returncode != 0:
-            problems.append(f"{name}: couldn't fetch {s['branch']} from {s['url']}: {(f.stderr or f.stdout).strip()[:200]}")
+            problems.append(f"{name}: couldn't fetch {s['branch']} from {s['url']}: "
+                            f"{(f.stderr or f.stdout).strip()[:200]}")
             continue
         new = run(["git", "rev-parse", "FETCH_HEAD"], cwd=clone).stdout.strip()
         branch = run(["git", "branch", "--show-current"], cwd=clone, check=False).stdout.strip()
         if branch != s["branch"]:
-            problems.append(f"{name}: {clone} is on '{branch or 'a detached HEAD'}', but updates follow '{s['branch']}'")
+            problems.append(f"{name}: {clone} is on '{branch or 'a detached HEAD'}', "
+                            f"but updates follow '{s['branch']}'")
             continue
         ahead = int(run(["git", "rev-list", "--count", f"{new}..HEAD"], cwd=clone).stdout.strip())
         behind = int(run(["git", "rev-list", "--count", f"HEAD..{new}"], cwd=clone).stdout.strip())
@@ -615,7 +623,8 @@ def cmd_update(a):
         if behind:
             m = run(["git", "merge", "--ff-only", "-q", new], cwd=clone, check=False)
             if m.returncode != 0:
-                die(f"{name}: couldn't fast-forward (uncommitted changes in the way?):\n{(m.stderr or m.stdout).strip()}")
+                die(f"{name}: couldn't fast-forward (uncommitted changes in the way?):\n"
+                    f"{(m.stderr or m.stdout).strip()}")
     restart = publish_and_deploy({n: Path(comps[n]) for n in names}, [Path(r) for r in workspace_roots()],
                                  cfg.get("dev", False))
     for name in restart:
@@ -649,7 +658,8 @@ def detect_gates(repo):
         except ValueError:
             scripts = {}
         runner = "pnpm" if (repo / "pnpm-lock.yaml").exists() else "yarn" if (repo / "yarn.lock").exists() else "npm"
-        rs = (lambda s: f"{runner} {s}") if runner != "npm" else (lambda s: f"npm run {s}" if s != "test" else "npm test")
+        rs = (lambda s: f"{runner} {s}") if runner != "npm" else (lambda s: f"npm run {s}" if s != "test"
+                                                                  else "npm test")
         if "test" in scripts:
             gate = " && ".join([rs(s) for s in ("lint", "typecheck") if s in scripts] + [rs("test")])
             fast = next((rs(s) for s in ("lint", "typecheck") if s in scripts), rs("test"))
@@ -886,7 +896,8 @@ def inside_a_root(d):
     roots = [Path(r) for r in workspace_roots()]
     if not any(d == r or r in d.parents for r in roots):
         die(f"the demo must live inside a workspace root ({', '.join(map(str, roots)) or 'none; run abacus install'}) "
-            f"so the repo fence applies (got {d}). Add one with `abacus install --workspace ... --workspace {d.parent}`")
+            f"so the repo fence applies (got {d}). "
+            f"Add one with `abacus install --workspace ... --workspace {d.parent}`")
 
 
 def prepare_demo_dir(a):
@@ -1407,7 +1418,8 @@ def main(argv=None):
             s.add_argument("--empty-boards", action="store_true",
                            help="heartbeat: start with no beads filed, to test filing")
     sub.add_parser("chat"); sub.add_parser("status")
-    pr = sub.add_parser("prune"); pr.add_argument("--keep", type=int, default=1); pr.add_argument("--dry-run", action="store_true")
+    pr = sub.add_parser("prune"); pr.add_argument("--keep", type=int, default=1)
+    pr.add_argument("--dry-run", action="store_true")
     sl = sub.add_parser("statusline"); sl.add_argument("action", choices=("enable", "disable"))
     how = sl.add_mutually_exclusive_group()
     how.add_argument("--wrap", action="store_true", help="keep the status line you already have and append to it")
