@@ -58,6 +58,7 @@ a shared Beads remote is set up (`bd dolt push`).
 - **The message protocol is a convention.** No parser rejects a malformed DISPATCH. Enforcement comes from logbook
   preconditions, tests over the templates, and verification on receipt.
 - **The worker contract is advisory.** It binds only repositories that adopted it.
+- **A repository's own checks also judge the vendored files.** The fast check runs on every commit, including the adoption commit, so a repository with strict lint, format or spelling rules refuses Abacus's guards, skills and workflows under `.claude/`. Exclude `.claude/` from those tools before adopting (for ruff, `extend-exclude = [".claude"]`).
 - **Workflow-stage detection** (`stage-writes` guard) relies on the hook payload's `agent_type` starting with
   `workflow` (observed live as `workflow-subagent` on Claude Code 2.1.296), or on `ABACUS_STAGE=1`. Re-check after
   Claude Code upgrades: `agent_type` is recorded in `~/.abacus/state/refusals.jsonl`. `abacus-finalize` is the
