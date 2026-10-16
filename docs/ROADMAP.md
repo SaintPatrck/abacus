@@ -59,6 +59,7 @@ a shared Beads remote is set up (`bd dolt push`).
   preconditions, tests over the templates, and verification on receipt.
 - **The worker contract is advisory.** It binds only repositories that adopted it.
 - **A repository's own checks also judge the vendored files.** The fast check runs on every commit, including the adoption commit, so a repository with strict lint, format or spelling rules refuses Abacus's guards, skills and workflows under `.claude/`. Exclude `.claude/` from those tools before adopting (for ruff, `extend-exclude = [".claude"]`).
+- **Beads are visible only from inside each repository.** Every repository keeps its own board, so an operator working from a directory above the repositories has no direct view of the beads Abacus is working from. `abacus status` shows what is in flight and `abacus-board find` searches every fleet board by text; for anything else, ask the concierge or run `bd` inside the repository.
 - **Workflow-stage detection** (`stage-writes` guard) relies on the hook payload's `agent_type` starting with
   `workflow` (observed live as `workflow-subagent` on Claude Code 2.1.296), or on `ABACUS_STAGE=1`. Re-check after
   Claude Code upgrades: `agent_type` is recorded in `~/.abacus/state/refusals.jsonl`. `abacus-finalize` is the
