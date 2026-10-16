@@ -1,6 +1,9 @@
 # Roadmap and known limits
 
 ## Next
+- **Draft PRs by default for shared repositories.** Draft-PR landing exists now (`"landing": "draft-pr"` in a
+  repository's `.abacus/config.json`), but it's opt-in and `abacus add` doesn't offer it yet. It should ask, and the
+  demos should show it.
 - **Fewer trips to the terminal.** Day to day, you should only need the concierge. Bringing a repository in is one
   command now (`abacus add`); next it becomes a conversation ("add ~/Source/repos/server to Abacus") that proposes
   the adoption for you to confirm, using the same steps.
@@ -27,8 +30,10 @@ deduplicated, so a repeat shows up as a note on one bead rather than a new one. 
 a shared Beads remote is set up (`bd dolt push`).
 
 ## Known limits (be honest about these)
-- **Push mode pushes straight to the default branch.** It suits sandboxes and the demos' local remotes. On a shared
-  repository, set `"landing": "draft-pr"` so each bead ends at a draft PR ([Draft-PR landing](DRAFT-PR-LANDING.md)).
+- **A build pushes to the default branch unless the repository opts into draft PRs.** Set `"landing": "draft-pr"`
+  in its `.abacus/config.json` for any repository whose default branch is protected or shared: each bead then lands
+  on its own branch and closes when its draft PR opens, and merging stays with people. Draft-PR landing needs the
+  GitHub CLI (`gh`), signed in. See [Draft-PR landing](DRAFT-PR-LANDING.md).
 - **Cross-repository dependencies are recorded on the boards, but enforced by the logbook.** Beads 1.3 stores
   `external:<project>:<capability>` edges and `bd ship` marks capabilities delivered. With separate embedded
   databases, `bd ready` doesn't treat unshipped external edges as blocking. Abacus records the edge for visibility,

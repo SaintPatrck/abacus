@@ -123,9 +123,25 @@ state/          logbook.db, memory.db, refusals.jsonl, redactions.jsonl (counts 
 ```
 
 ## Upgrading
-`git pull` each component, then re-run `./install.sh` (it keeps your workspace roots). It re-publishes, redeploys, and names any
-live role sessions that need a restart. To roll new conventions into an adopted repository, run `abacus-adopt` there,
-review the diff, run `abacus-doctor` and commit.
+```sh
+abacus update --check    # what's new: the new commits and changelog entries, without changing anything
+abacus update            # fast-forward your clones, publish, deploy, then run the doctor
+```
+`abacus update` fetches each repository from its configured source and fast-forwards your clone. It stops before
+changing anything if a clone has local commits or is on another branch. It doesn't re-ask the setup questions,
+restarts the concierge if it's idle, and names any other agent session that needs a restart. Uncommitted edits in
+a clone are left alone and aren't published. To roll new conventions into an adopted repository, run
+`abacus-adopt` there, review the diff, run `abacus-doctor` and commit.
+
+### Where updates come from (and forking)
+`sources.json` in the abacus repository names each repository's URL and branch; it defaults to
+`github.com/dasien/<repo>` on `main`. `abacus --version` shows where each one updates from.
+- **To run your own fork for your users,** edit `sources.json` in your fork of `abacus`. Everyone who installs from
+  your fork then updates from it.
+- **To follow a different fork or branch yourself,** add an override to `~/.abacus/config.json`:
+  `"sources": {"abacus-standards": {"url": "https://github.com/you/abacus-standards.git", "branch": "main"}}`.
+  If a clone's `origin` points elsewhere, `abacus update` offers to switch it (`--set-remote` does it without
+  asking).
 
 ## Uninstalling
 Stop sessions (`abacus demo stop`, or `abacus-session stop <name>`), then `rm -rf ~/.abacus`, and remove the

@@ -6,6 +6,7 @@
   abacus doctor                                prerequisites, install, PATH, folder trust, status line; run inside
                                                an adopted repository, it checks that repository too
   abacus add [PATH] [--gate CMD] [--yes]       bring a repository into Abacus: board, conventions, worker, trust
+  abacus update [--check]                      update your clones from their sources (sources.json), publish, deploy
   abacus trust                                 open each Abacus folder Claude Code hasn't trusted yet, one at a time
   abacus demo setup [--scenario S] [--force]   generate a demo sandbox: two-repo (default), decision or heartbeat
   abacus demo start                            start coder:repo-a, coder:repo-b and agent:concierge in Agent View
@@ -56,6 +57,7 @@ def say(msg):
 
 
 def die(msg):
+    sys.stdout.flush()  # what was already said comes first, even when output is piped
     print(f"abacus: ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
 
@@ -238,10 +240,41 @@ def installed(name):
     return pub.read_text().strip() if pub.exists() else "not installed"
 
 
+DEFAULT_SOURCE = "https://github.com/dasien/{name}.git"
+
+
+def sources():
+    """{repo: {url, branch}}: ~/.abacus/config.json "sources" overrides sources.json (which a fork edits), which
+    overrides the built-in default."""
+    try:
+        shipped = json.loads((ROOT / "sources.json").read_text()).get("repos", {})
+    except (OSError, ValueError):
+        shipped = {}
+    override = config().get("sources", {})
+    out = {}
+    for name in ("abacus",) + COMPONENTS:
+        s = {"url": DEFAULT_SOURCE.format(name=name), "branch": "main"}
+        s.update(shipped.get(name, {}))
+        s.update(override.get(name, {}))
+        out[name] = s
+    return out
+
+
+def repo_id(url):
+    """host/owner/repo for comparing remotes: git@github.com:o/r.git, https://github.com/o/r and .../r.git match."""
+    u = url.strip().rstrip("/")
+    u = u[:-4] if u.endswith(".git") else u
+    m = re.match(r"^[\w.-]+@([^:]+):(.+)$", u)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}".lower()
+    return re.sub(r"^[a-z+]+://([^@/]+@)?", "", u).lower()
+
+
 def print_version():
     print(f"abacus {version()}")
+    src = sources()
     for name in ("abacus",) + COMPONENTS:
-        print(f"  {name:<20} {installed(name)}")
+        print(f"  {name:<20} {installed(name):<14} updates from {src[name]['url']} ({src[name]['branch']})")
 
 
 def workspace_roots():
@@ -273,8 +306,10 @@ def publish(name, src, dev):
     if dev:
         dst.symlink_to(src)
         return "working tree (dev)"
-    if run(["git", "status", "--porcelain"], cwd=src, check=False).stdout.strip():
-        die(f"{name} has uncommitted changes; install publishes committed HEAD only (use --dev to link the tree)")
+    dirty = run(["git", "status", "--porcelain"], cwd=src, check=False).stdout.strip()
+    if dirty:
+        files = ", ".join(l[3:] for l in dirty.splitlines()[:5]) + (" …" if len(dirty.splitlines()) > 5 else "")
+        say(f"{name}: uncommitted changes aren't included ({files}); only committed work is published")
     head = run(["git", "rev-parse", "HEAD"], cwd=src, check=False)
     if head.returncode != 0:
         die(f"{name} has no commits yet; commit it or use --dev")
@@ -291,7 +326,8 @@ def cmd_install(a):
     rows = prereqs()
     if not print_prereqs(rows) and not a.skip_prereqs:
         missing = [name for name, ok, _, _ in rows if not ok]
-        if missing == ["bd"] and shutil.which("brew") and ask("Beads (bd) is missing. Install it now with `brew install beads`?", a.yes):
+        if missing == ["bd"] and shutil.which("brew") and ask("Beads (bd) is missing. "
+                                                              "Install it now with `brew install beads`?", a.yes):
             if subprocess.call(["brew", "install", "beads"]) != 0 or not shutil.which("bd"):
                 die("`brew install beads` did not succeed; install Beads and re-run")
         else:
@@ -303,6 +339,18 @@ def cmd_install(a):
     for r in roots:
         if not r.is_dir():
             die(f"workspace root {r} does not exist")
+    restart = publish_and_deploy(comps, roots, a.dev)
+    if restart:
+        say(f"restart these live role sessions to pick up the change: {', '.join(restart)}")
+    say("workspace roots (repo fence boundary; repositories in fleet.json are fenced wherever they live):")
+    for r in roots:
+        print(f"  {r}")
+    finish_setup(a)
+
+
+def publish_and_deploy(comps, roots, dev):
+    """Publish each repository's committed HEAD, keep config and state current, deploy the agents.
+    Returns the live agent sessions that need a restart."""
     HOME.mkdir(parents=True, exist_ok=True)
     (HOME / "bin").mkdir(exist_ok=True)
     for new, old in RENAMED.items():  # an install from before a rename leaves the old snapshot behind
@@ -312,15 +360,16 @@ def cmd_install(a):
         elif stale.exists():
             shutil.rmtree(stale)
     for name, src in comps.items():
-        say(f"{name}: {publish(name, src, a.dev)}")
+        say(f"{name}: {publish(name, src, dev)}")
         for cli in CLIS[name]:
             link = HOME / "bin" / cli
             if link.is_symlink() or link.exists():
                 link.unlink()
             link.symlink_to(HOME / "lib" / name / "bin" / cli)
     cfg = config()
-    cfg.update({"workspace_root": str(roots[0]), "workspace_roots": [str(r) for r in roots], "standards_path": str(HOME / "lib" / "abacus-standards"),
-                "components": {k: str(v) for k, v in comps.items()}, "dev": bool(a.dev)})
+    cfg.update({"workspace_root": str(roots[0]), "workspace_roots": [str(r) for r in roots],
+                "standards_path": str(HOME / "lib" / "abacus-standards"),
+                "components": {k: str(v) for k, v in comps.items()}, "dev": bool(dev)})
     (HOME / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
     env = {"PATH": f"{HOME / 'bin'}:{os.environ['PATH']}"}
     run(["abacus-logbook", "init"], env=env)
@@ -335,22 +384,16 @@ def cmd_install(a):
     if added or not fleet.exists():
         fleet.write_text(json.dumps(current, indent=2) + "\n")
         say(f"{fleet}: added {', '.join(added)} (add your repositories as coder:<repo> entries)")
-    deploy = ["abacus-deploy"] + (["--allow-unpublished"] if a.dev else [])
+    deploy = ["abacus-deploy"] + (["--allow-unpublished"] if dev else [])
     out = run(deploy, env=env, check=False)
     if out.returncode != 0:
         die(f"deploy failed: {(out.stderr or out.stdout).strip()}")
     deployed = sorted(d.name for d in (HOME / "agents").iterdir() if d.is_dir() and d.name != "hooks")
     say(f"roles deployed to {HOME / 'agents'} ({', '.join(deployed)})")
     try:
-        restart = json.loads(out.stdout).get("restart_needed") or []
+        return json.loads(out.stdout).get("restart_needed") or []
     except ValueError:
-        restart = []
-    if restart:
-        say(f"restart these live role sessions to pick up the change: {', '.join(restart)}")
-    say("workspace roots (repo fence boundary; repositories in fleet.json are fenced wherever they live):")
-    for r in roots:
-        print(f"  {r}")
-    finish_setup(a)
+        return []
 
 
 PATH_LINK_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "~/.local/bin", "~/bin")
@@ -409,7 +452,8 @@ def finish_setup(a):
                 cmd_statusline(argparse.Namespace(action="enable", replace=False, wrap=True))
             else:
                 todo.append("optional: `abacus statusline enable --wrap` to add Abacus's state to your status line")
-        elif ask("Show Abacus state in every Claude Code session's status line (edits ~/.claude/settings.json)?", a.yes):
+        elif ask("Show Abacus state in every Claude Code session's status line "
+                 "(edits ~/.claude/settings.json)?", a.yes):
             cmd_statusline(argparse.Namespace(action="enable", replace=False, wrap=False))
         else:
             todo.append("optional: `abacus statusline enable` to see Abacus state in every Claude Code session")
@@ -433,12 +477,15 @@ def cmd_doctor(a):
     ok = print_prereqs(prereqs())
     on_path, in_rc, rc = path_state()
     linked = abacus_link()
+    path_note = 'yes' if on_path else ('set in ' + str(rc) + ' (new terminals have it)' if in_rc
+                                       else 'add: ' + PATH_LINE)
     print(f"  {'ok ' if on_path or in_rc else 'MISSING'}  {'~/.abacus/bin on your PATH':<34} "
-          f"{'yes' if on_path else ('set in ' + str(rc) + ' (new terminals have it)' if in_rc else 'add: ' + PATH_LINE)}")
+          f"{path_note}")
     ok = ok and (on_path or in_rc)
     search = USER_PATH + ("" if on_path or not in_rc else os.pathsep + str(HOME / "bin"))
     cfg = config()
-    print(f"  {'ok ' if cfg else 'MISSING'}  {'~/.abacus/config.json':<34} {', '.join(workspace_roots()) or 'run abacus install'}")
+    print(f"  {'ok ' if cfg else 'MISSING'}  {'~/.abacus/config.json':<34} "
+          f"{', '.join(workspace_roots()) or 'run abacus install'}")
     for name, clis in CLIS.items():
         for cli in clis:
             p = (str(linked) if cli == "abacus" and linked else None) or \
@@ -489,6 +536,112 @@ def cmd_trust(a):
     return 0 if not left else 1
 
 
+# ------------------------------------------------------------------ update
+
+def whats_new(changelog, since):
+    """The changelog sections above `## <since>` (all of the newest one if that heading isn't there)."""
+    parts = re.split(r"(?m)^(?=## )", changelog)
+    out = []
+    for part in parts[1:]:
+        if re.match(rf"## {re.escape(since)}\b", part):
+            break
+        out.append(part.rstrip())
+    return out
+
+
+def session_state(name):
+    try:
+        sessions = json.loads(run(["claude", "agents", "--json"], check=False).stdout or "[]")
+    except ValueError:
+        return None
+    live = [s for s in sessions if s.get("name") == name and s.get("pid")]
+    return live[0].get("state") if live else None
+
+
+def cmd_update(a):
+    """Bring your clones up to date from their sources, then publish and deploy. No setup questions."""
+    cfg = config()
+    comps = cfg.get("components") or {}
+    names = ("abacus",) + COMPONENTS
+    if not all(comps.get(n) for n in names):
+        die("Abacus isn't installed from clones yet; run ./install.sh from your abacus clone first")
+    src = sources()
+    plan, problems = [], []
+    for name in names:
+        clone, s = Path(comps[name]), src[name]
+        if not (clone / ".git").exists():
+            problems.append(f"{name}: {clone} isn't a git clone")
+            continue
+        origin = run(["git", "remote", "get-url", "origin"], cwd=clone, check=False).stdout.strip()
+        if origin and repo_id(origin) != repo_id(s["url"]):
+            say(f"{name}: your clone's origin is {origin}, but updates come from {s['url']}")
+            if a.set_remote or ask(f"Point {name}'s origin at {s['url']}?"):
+                run(["git", "remote", "set-url", "origin", s["url"]], cwd=clone)
+        f = run(["git", "fetch", "-q", s["url"], s["branch"]], cwd=clone, check=False)
+        if f.returncode != 0:
+            problems.append(f"{name}: couldn't fetch {s['branch']} from {s['url']}: "
+                            f"{(f.stderr or f.stdout).strip()[:200]}")
+            continue
+        new = run(["git", "rev-parse", "FETCH_HEAD"], cwd=clone).stdout.strip()
+        branch = run(["git", "branch", "--show-current"], cwd=clone, check=False).stdout.strip()
+        if branch != s["branch"]:
+            problems.append(f"{name}: {clone} is on '{branch or 'a detached HEAD'}', "
+                            f"but updates follow '{s['branch']}'")
+            continue
+        ahead = int(run(["git", "rev-list", "--count", f"{new}..HEAD"], cwd=clone).stdout.strip())
+        behind = int(run(["git", "rev-list", "--count", f"HEAD..{new}"], cwd=clone).stdout.strip())
+        if ahead:
+            problems.append(f"{name}: has {ahead} local commit(s) that aren't in {s['url']} ({s['branch']}); push or "
+                            f"rebase them first")
+        log = run(["git", "log", "--oneline", f"HEAD..{new}"], cwd=clone).stdout.strip().splitlines()
+        plan.append((name, clone, new, behind, log))
+    for name, clone, new, behind, log in plan:
+        say(f"{name}: " + (f"{behind} new commit(s)" if behind else "up to date"))
+        for line in log[:8]:
+            print(f"    {line}")
+        if len(log) > 8:
+            print(f"    … and {len(log) - 8} more")
+    abacus_new = next((new for name, _, new, _, _ in plan if name == "abacus"), None)
+    if abacus_new:
+        changelog = run(["git", "show", f"{abacus_new}:CHANGELOG.md"], cwd=comps["abacus"], check=False).stdout
+        notes = whats_new(changelog, version())
+        if notes and any(b for _, _, _, b, _ in plan):
+            print(f"\nWhat's new since {version()}:\n")
+            print("\n\n".join(notes) + "\n")
+    if problems:
+        for p in problems:
+            say(f"can't update: {p}")
+        die("nothing was changed")
+    if a.check:
+        return 0
+    stale = [n for n in names if installed(n) not in (run(["git", "rev-parse", "--short=12", "HEAD"],
+                                                        cwd=comps[n], check=False).stdout.strip(),)]
+    if not any(b for _, _, _, b, _ in plan) and not stale:
+        say(f"already up to date (abacus {version()})")
+        return 0
+    for name, clone, new, behind, log in plan:
+        if behind:
+            m = run(["git", "merge", "--ff-only", "-q", new], cwd=clone, check=False)
+            if m.returncode != 0:
+                die(f"{name}: couldn't fast-forward (uncommitted changes in the way?):\n"
+                    f"{(m.stderr or m.stdout).strip()}")
+    restart = publish_and_deploy({n: Path(comps[n]) for n in names}, [Path(r) for r in workspace_roots()],
+                                 cfg.get("dev", False))
+    for name in restart:
+        if name == "agent:concierge" and not os.environ.get("ABACUS_NO_RESTART") \
+                and session_state(name) in ("idle", "done"):
+            run(["abacus-session", "stop", name, "--reason", "abacus update"], check=False)
+            run(["abacus-session", "start", name, "--reason", "abacus update"], check=False)
+            say(f"restarted {name} (it was idle)")
+        else:
+            say(f"restart {name} when it's free, to pick up the change")
+    print()
+    cmd_doctor(a)
+    new_version = (Path(comps["abacus"]) / "VERSION").read_text().strip()
+    say(f"updated to abacus {new_version}")
+    return 0
+
+
 # ------------------------------------------------------------------ add a repository
 
 def detect_gates(repo):
@@ -505,7 +658,8 @@ def detect_gates(repo):
         except ValueError:
             scripts = {}
         runner = "pnpm" if (repo / "pnpm-lock.yaml").exists() else "yarn" if (repo / "yarn.lock").exists() else "npm"
-        rs = (lambda s: f"{runner} {s}") if runner != "npm" else (lambda s: f"npm run {s}" if s != "test" else "npm test")
+        rs = (lambda s: f"{runner} {s}") if runner != "npm" else (lambda s: f"npm run {s}" if s != "test"
+                                                                  else "npm test")
         if "test" in scripts:
             gate = " && ".join([rs(s) for s in ("lint", "typecheck") if s in scripts] + [rs("test")])
             fast = next((rs(s) for s in ("lint", "typecheck") if s in scripts), rs("test"))
@@ -742,7 +896,8 @@ def inside_a_root(d):
     roots = [Path(r) for r in workspace_roots()]
     if not any(d == r or r in d.parents for r in roots):
         die(f"the demo must live inside a workspace root ({', '.join(map(str, roots)) or 'none; run abacus install'}) "
-            f"so the repo fence applies (got {d}). Add one with `abacus install --workspace ... --workspace {d.parent}`")
+            f"so the repo fence applies (got {d}). "
+            f"Add one with `abacus install --workspace ... --workspace {d.parent}`")
 
 
 def prepare_demo_dir(a):
@@ -1239,6 +1394,9 @@ def main(argv=None):
     i.add_argument("--skip-prereqs", action="store_true")
     i.add_argument("--yes", action="store_true", help="accept every offer (install Beads, PATH line, status line)")
     sub.add_parser("doctor"); sub.add_parser("trust")
+    up = sub.add_parser("update", help="update your clones from their sources, then publish and deploy")
+    up.add_argument("--check", action="store_true", help="show what's new without changing anything")
+    up.add_argument("--set-remote", action="store_true", help="point a clone's origin at its configured source")
     ad = sub.add_parser("add", help="bring a repository into Abacus")
     ad.add_argument("path", nargs="?", default=".")
     ad.add_argument("--gate", help="full test command, run before every push (detected if omitted)")
@@ -1260,7 +1418,8 @@ def main(argv=None):
             s.add_argument("--empty-boards", action="store_true",
                            help="heartbeat: start with no beads filed, to test filing")
     sub.add_parser("chat"); sub.add_parser("status")
-    pr = sub.add_parser("prune"); pr.add_argument("--keep", type=int, default=1); pr.add_argument("--dry-run", action="store_true")
+    pr = sub.add_parser("prune"); pr.add_argument("--keep", type=int, default=1)
+    pr.add_argument("--dry-run", action="store_true")
     sl = sub.add_parser("statusline"); sl.add_argument("action", choices=("enable", "disable"))
     how = sl.add_mutually_exclusive_group()
     how.add_argument("--wrap", action="store_true", help="keep the status line you already have and append to it")
@@ -1272,6 +1431,8 @@ def main(argv=None):
         return cmd_doctor(a)
     if a.cmd == "add":
         return cmd_add(a)
+    if a.cmd == "update":
+        return cmd_update(a)
     if a.cmd in ("chat", "status", "statusline", "trust", "prune"):
         return {"chat": cmd_chat, "status": cmd_status, "statusline": cmd_statusline, "trust": cmd_trust,
                 "prune": cmd_prune}[a.cmd](a)

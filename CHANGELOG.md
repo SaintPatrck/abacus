@@ -5,17 +5,26 @@ Bug fixes bump the patch number, features bump the minor number, and the major n
 operator decides it. See [docs/INSTALL.md](docs/INSTALL.md#versions).
 
 ## 0.9.0 (2026-10-16)
-- **A build can end at a draft PR.** With `"landing": "draft-pr"` in a repository's `.abacus/config.json`, each
-  bead lands on its own branch, `abacus/<slug>-<bead-id>`, and closes when `abacus-finalize` opens its draft PR.
-  A bead whose dependency still has an open PR stacks on that dependency's branch, and `abacus-verify` checks that
-  the commit is the head of the bead's PR. Merging stays with people. The default, `"landing": "push"`, pushes
-  straight to the default branch, and any other value is a config error. See
-  [docs/DRAFT-PR-LANDING.md](docs/DRAFT-PR-LANDING.md).
-- **An end-to-end guide.** [docs/END-TO-END.md](docs/END-TO-END.md) follows the path from install to results, with
-  diagrams of the whole path and of a typical "plan, then build" request, and links each step to its details.
-- **Commits carry no attribution trailer.** `abacus-finalize` no longer adds `Co-Authored-By: Claude` to bead and
-  record commits, so each repository keeps its own attribution policy, including shared ones where those commits
-  land in reviewed PRs.
+- **Draft-PR landing** (contributed by Patrick Honkonen; implements `abacus-8jc`).
+  - **Opting in:** with `"landing": "draft-pr"` in a repository's `.abacus/config.json`, each bead lands on its own
+    branch, `abacus/<slug>-<bead id>`, and closes when its draft PR opens. Merging stays with people. The default,
+    "push", is unchanged, and an unknown value is refused, so a typo can't fall back to pushing.
+  - **Stacking across repos:** a bead whose dependency still has an open PR builds on that PR's branch, and refuses
+    if there are two.
+  - **Verification:** `abacus-verify` checks the head of the bead's open PR.
+  - **The agents:** the orchestrator's instructions and the protocol say what "done" means in this mode.
+  - **Requirements:** needs the GitHub CLI (`gh`), signed in.
+- **Finalize no longer adds a Co-Authored-By trailer** to bead and record commits (contributed by Patrick
+  Honkonen). Each repository decides its own attribution policy.
+- **`abacus update`** brings your clones up to date and publishes them, without re-running setup.
+  - It fetches each repository from its configured source and fast-forwards.
+  - It stops before changing anything if a clone has local commits or is on another branch.
+  - It shows the new commits and the changelog entries since your installed version (`--check` stops there).
+  - Then it publishes, deploys, restarts the concierge if it's idle, and runs the doctor.
+- **Where updates come from is configurable.** `sources.json` in the abacus repository names each repository's URL
+  and branch, defaulting to `github.com/dasien/<repo>` on `main`. A fork edits it for its own users, and a user can
+  override it in `~/.abacus/config.json`. `abacus --version` shows each repository's source.
+- **Uncommitted edits no longer block an install.** They're listed and left out; only committed work is published.
 
 ## 0.8.3 (2026-10-15)
 - **A crashing guard refuses instead of allowing.** Claude Code treats a hook's exit 1 as non-blocking, so an

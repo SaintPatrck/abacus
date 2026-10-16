@@ -1,13 +1,10 @@
 # Abacus
 
-**Orchestrated multi-agent development at Bitwarden.**
+**Orchestrated multi-agent development**
 
 Abacus is a reference implementation of an orchestrated development pattern. 
 It's built on Claude Code's Dynamic Workflows, Agent View and cross-session messaging, with Beads as
 the system of record.
-
-> The name: an abacus is beads on rods. Each rod is a repository, each bead a unit of agent-executable work,
-> and the frame keeps the count honest.
 
 Abacus has four parts:
 
@@ -56,6 +53,7 @@ The full walkthrough is in [docs/DEMO.md](docs/DEMO.md).
 abacus chat                 # open the concierge (starts it if needed); also reachable from `claude agents`
 abacus status               # what needs you, what's running, what finished
 abacus statusline enable    # show that in every Claude Code session's status line (--wrap keeps yours)
+abacus update               # get the latest Abacus (--check shows what's new first)
 ```
 Tell the concierge what you want, in plain language. Behind the scenes it maps your request onto a few defined acts,
 and asks you when it can't tell which you mean:
